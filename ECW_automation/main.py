@@ -198,6 +198,11 @@ async def pcarelink_send_messages(patients):
         await asyncio.sleep(5)
         print("Login submitted!")
 
+        if "profile" in page.url:
+            print("Complete-your-profile popup detected - dismissing via ReachMyDr logo...")
+            await page.get_by_text("ReachMyDr", exact=False).first.click()
+            await asyncio.sleep(3)
+
         await page.locator('[data-test-id="pcl-menuDropDownComponent"]').click()
         await page.locator('[data-test-id="pcl-dashboard-popOver1"]').click()
         await page.wait_for_load_state("networkidle")
