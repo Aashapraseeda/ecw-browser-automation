@@ -8,6 +8,8 @@ from datetime import date, timedelta
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright
 
+import state_db
+
 load_dotenv()
 
 # --- CREDENTIALS ---
@@ -25,9 +27,14 @@ FILTERED_EXCEL_PATH = os.path.join(os.path.dirname(EXCEL_PATH), "filtered_schedu
 DOC_FOLDER = os.getenv("ECW_PATIENTS_DOC_FOLDER")
 
 # --- SETTINGS ---
-INITIAL_CHECK_INTERVAL = 180
+# NOTE: the completed-form check is now a single pass per run - cron itself
+# (running this script every few hours) provides the "check again later"
+# behavior. There is no internal wait loop anymore.
 
-LONG_CHECK_INTERVAL = 360
+ENABLE_REMINDERS = os.getenv("ENABLE_REMINDERS", "false").lower() == "true"
+REMINDER_INTERVAL_HOURS = int(os.getenv("REMINDER_INTERVAL_HOURS", "48"))
+REMINDER_MAX_COUNT = int(os.getenv("REMINDER_MAX_COUNT", "3"))
+STATE_RETENTION_DAYS = int(os.getenv("STATE_RETENTION_DAYS", "30"))
 
 VISIT_TYPE_TO_FORM = {
     "9 MONTH WC": "ASQ9Mos",
@@ -93,6 +100,7 @@ def read_patients_from_excel():
         last_name = row[col["Patient Last Name"]]
         first_name = row[col["Patient First Name"]]
         visit_type_raw = row[col["Visit Type"]]
+        appointment_date_raw = row[col["Appointment Date"]]
         if not acct_no:
             continue
         visit_type_desc = str(visit_type_raw).split(":")[-1].strip().upper() if visit_type_raw else ""
@@ -103,6 +111,7 @@ def read_patients_from_excel():
             continue
         patients.append({
             "acct_no": str(acct_no).strip(),
+            "appointment_date": state_db.normalize_date(appointment_date_raw),
             "last_name": str(last_name).strip() if last_name else "",
             "first_name": str(first_name).strip() if first_name else "",
             "folder_name": f"{last_name} {first_name}_doc".strip(),
@@ -463,21 +472,24 @@ async def pcarelink_send_messages(patients):
 # STEP 3 — PEDIFORMS: CHECK & DOWNLOAD
 # ─────────────────────────────────────────
 
-async def check_and_download_completed(page, patients, downloaded):
+async def check_and_download_completed(page, patients):
     """
     Search each patient without status filter, then check if they have
     a Completed submission. If multiple submissions exist, click the
     most recent Completed one and download it.
+
+    Single pass only - returns the list of patients newly downloaded
+    this run. Cron re-invoking this script provides the "check again
+    later" behavior; there is no internal wait loop here anymore.
     """
     print(f"\nChecking for completed forms...")
+    newly_downloaded = []
     # Set week filter only — no status filter to avoid missing patients
     # with multiple submissions where overall status may show differently
     await page.get_by_role("combobox").nth(4).select_option("week")
     await page.wait_for_timeout(1000)
 
     for patient in patients:
-        if patient["acct_no"] in downloaded:
-            continue
         try:
             search_box = page.get_by_role("textbox", name="Search…")
             await search_box.click()
@@ -525,7 +537,8 @@ async def check_and_download_completed(page, patients, downloaded):
             await download.save_as(save_path)
             print(f"Saved: {save_path}")
 
-            downloaded.add(patient["acct_no"])
+            state_db.mark_downloaded(patient["acct_no"], patient["appointment_date"])
+            newly_downloaded.append(patient)
 
             await page.get_by_role("link", name="← Back to today's patients").click()
             await page.wait_for_timeout(1000)
@@ -538,60 +551,43 @@ async def check_and_download_completed(page, patients, downloaded):
                 pass
             continue
 
+    return newly_downloaded
+
 async def pediforms_check_and_download(patients):
+    """
+    One single pass over `patients` (pending patients pulled from state_db,
+    not just today's Excel). Returns list of newly-downloaded patients.
+    """
     print("\n" + "="*50)
     print("STEP 3 — PEDIFORMS: CHECKING FOR COMPLETED FORMS")
     print("="*50)
 
-    downloaded = set()
-    total = len(patients)
-    check_num = 0
-    elapsed_minutes = 0
+    if not patients:
+        print("No patients pending form completion.")
+        return []
 
-    while True:
-        check_num += 1
-        if elapsed_minutes < 720:
-            interval = INITIAL_CHECK_INTERVAL
-            phase = "Phase 1 (every 3 hours)"
-        
-        else:
-            interval = LONG_CHECK_INTERVAL
-            phase = "Phase 2(every 6 hours)"
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=False, slow_mo=300)
+            context = await browser.new_context()
+            page = await context.new_page()
+            print("Logging into Pediforms...")
+            await page.goto("https://admin.pediformpro.com/staff/login", timeout=60000, wait_until="domcontentloaded")
+            await asyncio.sleep(3)
+            await page.get_by_role("textbox", name="Organization name").fill(PEDIFORMS_ORG)
+            await page.get_by_role("textbox", name="Email").fill(PEDIFORMS_EMAIL)
+            await page.get_by_role("textbox", name="Password").fill(PEDIFORMS_PASSWORD)
+            await page.get_by_role("button", name="Sign in").click()
+            await page.wait_for_load_state("networkidle")
 
-        print(f"\nCheck #{check_num} — {len(downloaded)}/{total} forms — {phase}")
+            newly_downloaded = await check_and_download_completed(page, patients)
+            await browser.close()
+            return newly_downloaded
 
-        try:
-            async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=False, slow_mo=300)
-                context = await browser.new_context()
-                page = await context.new_page()
-                print("Logging into Pediforms...")
-                await page.goto("https://admin.pediformpro.com/staff/login", timeout=60000, wait_until="domcontentloaded")
-                await asyncio.sleep(3)
-                await page.get_by_role("textbox", name="Organization name").fill(PEDIFORMS_ORG)
-                await page.get_by_role("textbox", name="Email").fill(PEDIFORMS_EMAIL)
-                await page.get_by_role("textbox", name="Password").fill(PEDIFORMS_PASSWORD)
-                await page.get_by_role("button", name="Sign in").click()
-                await page.wait_for_load_state("networkidle")
-
-                await check_and_download_completed(page, patients, downloaded)
-                await browser.close()
-
-            if len(downloaded) > 0:
-                print(f"\n{len(downloaded)} forms downloaded — uploading to eCW now...")
-                await ecw_upload_forms(patients)
-
-            if len(downloaded) >= total:
-                print(f"\nAll {total} forms downloaded and uploaded!")
-                return True
-
-        except Exception as e:
-            print(f"\nCheck #{check_num} failed: {e}")
-            print("Will retry on next scheduled check.")
-
-        print(f"\nWaiting {interval} minutes before next check...")
-        await asyncio.sleep(interval * 60)
-        elapsed_minutes += interval
+    except Exception as e:
+        print(f"\nCheck failed: {e}")
+        print("Will retry on next scheduled cron run.")
+        return []
 
 # ─────────────────────────────────────────
 # STEP 4 — ECW: UPLOAD FORMS
@@ -652,6 +648,8 @@ async def ecw_upload_forms(patients):
         await page.get_by_role("textbox", name="Last Name, First Name").wait_for(timeout=30000)
         print("Patient search ready!")
 
+        uploaded_ok = []
+
         for index, patient in enumerate(patients):
             print(f"\nProcessing {index+1}/{len(patients)}: {patient['last_name']} {patient['first_name']}")
             folder_path = os.path.join(DOC_FOLDER, patient["folder_name"])
@@ -711,6 +709,7 @@ async def ecw_upload_forms(patients):
                         print(f"Already uploaded: {filename}")
                 if not new_files:
                     print("All files already uploaded!")
+                    uploaded_ok.append(patient)
                     await _go_to_search(page)
                     continue
                 for file_index, file_path in enumerate(new_files):
@@ -739,6 +738,7 @@ async def ecw_upload_forms(patients):
                     print(f"File {file_index+1} saved!")
                     await asyncio.sleep(1)
                 print(f"All files uploaded!")
+                uploaded_ok.append(patient)
                 await _go_to_search(page)
             except Exception as e:
                 print(f"Error: {e}")
@@ -750,6 +750,7 @@ async def ecw_upload_forms(patients):
 
         await browser.close()
         print("\nAll forms uploaded to eCW!")
+        return uploaded_ok
 
 async def _go_to_search(page):
     await page.keyboard.press("Escape")
@@ -777,19 +778,63 @@ async def main():
 
     await ecw_export_schedule()
 
-    patients = read_patients_from_excel()
-    print(f"\nFound {len(patients)} ASQ patients")
+    exported_patients = read_patients_from_excel()
+    print(f"\nFound {len(exported_patients)} ASQ patients in this export")
 
-    if not patients:
-        print("No ASQ patients found in Excel!")
-        return
+    # --- Split into new vs already-processed (by acct_no + appointment_date) ---
+    new_patients = [
+        p for p in exported_patients
+        if not state_db.is_known(p["acct_no"], p["appointment_date"])
+    ]
+    already_known = len(exported_patients) - len(new_patients)
+    print(f"{len(new_patients)} new patient-visits, {already_known} already processed (skipping resend)")
 
-    await pediforms_send_forms(patients)
-    await pcarelink_send_messages(patients)
-    await pediforms_check_and_download(patients)
+    if new_patients:
+        await pediforms_send_forms(new_patients)
+        await pcarelink_send_messages(new_patients)
+        for p in new_patients:
+            state_db.insert_form_sent(p)
+    else:
+        print("No new patients to send forms to this run.")
+
+    # --- Check ALL pending patients (from DB, not just today's export) ---
+    pending = state_db.get_pending_patients()
+    print(f"\n{len(pending)} patient-visits pending form completion (across all runs)")
+
+    if pending:
+        newly_downloaded = await pediforms_check_and_download(pending)
+
+        # Upload anything downloaded (this run or a prior run's retry)
+        to_upload = state_db.get_patients_needing_upload()
+        if to_upload:
+            uploaded_ok = await ecw_upload_forms(to_upload)
+            for p in uploaded_ok:
+                state_db.mark_completed(p["acct_no"], p["appointment_date"])
+            print(f"\n{len(uploaded_ok)}/{len(to_upload)} uploaded and marked completed.")
+
+        # --- Reminders for patients still not completed ---
+        reminder_candidates = state_db.get_patients_needing_reminder(
+            REMINDER_INTERVAL_HOURS, REMINDER_MAX_COUNT
+        )
+        if reminder_candidates:
+            if ENABLE_REMINDERS:
+                print(f"\nSending reminders to {len(reminder_candidates)} patient(s)...")
+                await pcarelink_send_messages(reminder_candidates)
+                for p in reminder_candidates:
+                    state_db.record_reminder_sent(p["acct_no"], p["appointment_date"])
+            else:
+                print(
+                    f"\n{len(reminder_candidates)} patient(s) are due for a reminder, "
+                    "but ENABLE_REMINDERS is off - skipping (set ENABLE_REMINDERS=true in .env to enable)."
+                )
+
+    # --- Housekeeping: drop completed records past the retention window ---
+    deleted = state_db.cleanup_old_completed(STATE_RETENTION_DAYS)
+    if deleted:
+        print(f"\nCleaned up {deleted} completed record(s) older than {STATE_RETENTION_DAYS} days.")
 
     print("\n" + "="*50)
-    print("PIPELINE COMPLETE!")
+    print("RUN COMPLETE!")
     print("="*50)
 
 if __name__ == "__main__":

@@ -2,3 +2,9 @@
 .env
 __pycache__/
 .vscode/
+
+# Patient data - never commit real patient info
+ECW_automation/data/
+ECW_automation/patients_doc/
+ECW_automation/*.xlsx
+ECW_automation/logs/
