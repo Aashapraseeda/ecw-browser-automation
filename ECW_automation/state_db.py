@@ -37,8 +37,6 @@ def _connect():
             status            TEXT NOT NULL DEFAULT 'form_sent',
             form_sent_at      TEXT,
             completed_at      TEXT,
-            reminder_count    INTEGER NOT NULL DEFAULT 0,
-            last_reminder_at  TEXT,
             PRIMARY KEY (acct_no, appointment_date)
         )
     """)
@@ -116,39 +114,6 @@ def mark_completed(acct_no, appointment_date):
     conn = _connect()
     conn.execute(
         "UPDATE patients SET status='completed', completed_at=? WHERE acct_no=? AND appointment_date=?",
-        (datetime.utcnow().isoformat(), acct_no, appointment_date),
-    )
-    conn.commit()
-    conn.close()
-
-
-def get_patients_needing_reminder(interval_hours, max_reminders):
-    conn = _connect()
-    conn.row_factory = sqlite3.Row
-    cutoff = (datetime.utcnow() - timedelta(hours=interval_hours)).isoformat()
-    rows = conn.execute(
-        """
-        SELECT * FROM patients
-        WHERE status = 'form_sent'
-        AND reminder_count < ?
-        AND (
-            (last_reminder_at IS NULL AND form_sent_at <= ?)
-            OR last_reminder_at <= ?
-        )
-        """,
-        (max_reminders, cutoff, cutoff),
-    ).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
-
-
-def record_reminder_sent(acct_no, appointment_date):
-    conn = _connect()
-    conn.execute(
-        """
-        UPDATE patients SET reminder_count = reminder_count + 1, last_reminder_at = ?
-        WHERE acct_no=? AND appointment_date=?
-        """,
         (datetime.utcnow().isoformat(), acct_no, appointment_date),
     )
     conn.commit()

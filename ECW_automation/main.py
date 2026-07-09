@@ -30,10 +30,10 @@ DOC_FOLDER = os.getenv("ECW_PATIENTS_DOC_FOLDER")
 # NOTE: the completed-form check is now a single pass per run - cron itself
 # (running this script every few hours) provides the "check again later"
 # behavior. There is no internal wait loop anymore.
+#
+# Reminder messages are intentionally not implemented yet - to be added
+# separately once the cron architecture is finalized.
 
-ENABLE_REMINDERS = os.getenv("ENABLE_REMINDERS", "false").lower() == "true"
-REMINDER_INTERVAL_HOURS = int(os.getenv("REMINDER_INTERVAL_HOURS", "48"))
-REMINDER_MAX_COUNT = int(os.getenv("REMINDER_MAX_COUNT", "3"))
 STATE_RETENTION_DAYS = int(os.getenv("STATE_RETENTION_DAYS", "30"))
 
 VISIT_TYPE_TO_FORM = {
@@ -811,22 +811,6 @@ async def main():
             for p in uploaded_ok:
                 state_db.mark_completed(p["acct_no"], p["appointment_date"])
             print(f"\n{len(uploaded_ok)}/{len(to_upload)} uploaded and marked completed.")
-
-        # --- Reminders for patients still not completed ---
-        reminder_candidates = state_db.get_patients_needing_reminder(
-            REMINDER_INTERVAL_HOURS, REMINDER_MAX_COUNT
-        )
-        if reminder_candidates:
-            if ENABLE_REMINDERS:
-                print(f"\nSending reminders to {len(reminder_candidates)} patient(s)...")
-                await pcarelink_send_messages(reminder_candidates)
-                for p in reminder_candidates:
-                    state_db.record_reminder_sent(p["acct_no"], p["appointment_date"])
-            else:
-                print(
-                    f"\n{len(reminder_candidates)} patient(s) are due for a reminder, "
-                    "but ENABLE_REMINDERS is off - skipping (set ENABLE_REMINDERS=true in .env to enable)."
-                )
 
     # --- Housekeeping: drop completed records past the retention window ---
     deleted = state_db.cleanup_old_completed(STATE_RETENTION_DAYS)
