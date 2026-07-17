@@ -80,6 +80,12 @@ VISIT_TYPE_TO_FORM_FILENAME = {
     "48 MONTHWC": "ASQ_48_Months",
 }
 
+# Appointments at these facilities are excluded from this clinic's filtered
+# schedule - Lone Star Pediatrics Midlothian is handled by its own separate
+# automation project now, so it must not be double-processed here. Compared
+# case-insensitively with leading/trailing whitespace stripped.
+EXCLUDED_FACILITY_NAMES = {"lone star pediatrics midlothian"}
+
 # ─────────────────────────────────────────
 # SHARED HELPERS
 # ─────────────────────────────────────────
@@ -88,6 +94,7 @@ def read_patients_from_excel():
     """
     Production filter: all patients with 9-48 month WC visit types.
     No visit reason filter — all ASQ-eligible patients included.
+    Excludes EXCLUDED_FACILITY_NAMES (see above) before any other filtering.
     """
     wb = openpyxl.load_workbook(EXCEL_PATH, read_only=True)
     ws = wb.active
@@ -103,6 +110,11 @@ def read_patients_from_excel():
         appointment_date_raw = row[col["Appointment Date"]]
         if not acct_no:
             continue
+        if "Appointment Facility Name" in col:
+            facility_name_raw = row[col["Appointment Facility Name"]]
+            if facility_name_raw and str(facility_name_raw).strip().lower() in EXCLUDED_FACILITY_NAMES:
+                print(f"Skipping {last_name} {first_name} - excluded facility: {facility_name_raw!r}")
+                continue
         visit_type_desc = str(visit_type_raw).split(":")[-1].strip().upper() if visit_type_raw else ""
         form_name = VISIT_TYPE_TO_FORM.get(visit_type_desc, None)
         form_filename = VISIT_TYPE_TO_FORM_FILENAME.get(visit_type_desc, "form")

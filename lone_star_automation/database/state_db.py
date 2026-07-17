@@ -1,23 +1,25 @@
 """
-state_db.py
------------
-Persistent tracking of which patients have already had a PediForms form
-and PCareLink message sent, so repeated runs (e.g. 9 AM / 1 PM / 5 PM cron)
-never resend to the same patient-visit twice.
+database/state_db.py
+---------------------
+Persistent tracking of which patients have already had a Patient Forms Now
+form sent, so repeated runs (e.g. 9 AM / 1 PM / 5 PM cron) never resend to
+the same patient-visit twice.
 
 Identity key: (acct_no, appointment_date) - not acct_no alone, since the
 same patient will have a brand new visit months later that must still
 be processed as "new".
+
+Ported verbatim from the reference project (ECW_automation/state_db.py) -
+only the DB path now comes from config.settings instead of a bare os.getenv.
 """
 
 import os
 import sqlite3
 from datetime import datetime, timedelta
 
-DB_PATH = os.getenv(
-    "STATE_DB_PATH",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "patients_state.db"),
-)
+from config import settings
+
+DB_PATH = settings.STATE_DB_PATH
 
 
 def _connect():
@@ -155,3 +157,40 @@ def delete_by_acct_no(acct_numbers):
     deleted = cur.rowcount
     conn.close()
     return deleted
+
+
+if __name__ == "__main__":
+    # Smoke test: insert -> is_known -> pending -> downloaded -> needing_upload -> completed -> cleanup
+    test_patient = {
+        "acct_no": "TEST001",
+        "appointment_date": "2026-07-16",
+        "last_name": "Test",
+        "first_name": "Patient",
+        "visit_type": "9 MONTH WC",
+        "form_name": "ASQ9Mos",
+        "form_filename": "ASQ9Mos",
+        "folder_name": "Test Patient_doc",
+        "search_name": "Test,Patient",
+    }
+
+    print(f"DB path: {DB_PATH}")
+    assert not is_known(test_patient["acct_no"], test_patient["appointment_date"])
+    insert_form_sent(test_patient)
+    assert is_known(test_patient["acct_no"], test_patient["appointment_date"])
+    pending = get_pending_patients()
+    assert any(p["acct_no"] == "TEST001" for p in pending)
+    print(f"Pending: {len(pending)} (includes TEST001: OK)")
+
+    mark_downloaded(test_patient["acct_no"], test_patient["appointment_date"])
+    needing_upload = get_patients_needing_upload()
+    assert any(p["acct_no"] == "TEST001" for p in needing_upload)
+    print(f"Needing upload: {len(needing_upload)} (includes TEST001: OK)")
+
+    mark_completed(test_patient["acct_no"], test_patient["appointment_date"])
+
+    # Clean up the test row itself (retention_days=0 deletes anything completed now-or-before-now)
+    deleted = cleanup_old_completed(retention_days=0)
+    assert deleted >= 1
+    assert not is_known(test_patient["acct_no"], test_patient["appointment_date"])
+    print(f"Cleanup deleted {deleted} record(s), TEST001 no longer known: OK")
+    print("\nstate_db.py smoke test PASSED")

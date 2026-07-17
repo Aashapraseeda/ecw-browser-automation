@@ -2,10 +2,16 @@ import asyncio
 import os
 import glob
 import openpyxl
+from dotenv import load_dotenv
 from playwright.async_api import async_playwright
 
+load_dotenv()
+
+ECW_PATIENTS_EXCEL = os.getenv("ECW_PATIENTS_EXCEL")
+ECW_PATIENTS_DOC_FOLDER = os.getenv("ECW_PATIENTS_DOC_FOLDER")
+
 def read_patients():
-    wb = openpyxl.load_workbook(r"C:\Users\bhanu\OneDrive\Desktop\ecW_patients.xlsx")
+    wb = openpyxl.load_workbook(ECW_PATIENTS_EXCEL)
     ws = wb.active
     patients = []
     for row in ws.iter_rows(min_row=1, values_only=True):
@@ -24,7 +30,7 @@ def read_patients():
 
 def get_all_files(patient):
     folder_path = os.path.join(
-        r"C:\Users\bhanu\OneDrive\Desktop\eCW_patients_doc",
+        ECW_PATIENTS_DOC_FOLDER,
         patient["folder_name"]
     )
     if not os.path.exists(folder_path):

@@ -1,0 +1,10 @@
+.env
+__pycache__/
+.vscode/
+
+# Patient data - never commit real patient info
+data/
+patients_doc/
+*.xlsx
+*.pdf
+logs/

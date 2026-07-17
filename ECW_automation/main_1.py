@@ -76,6 +76,44 @@ VISIT_TYPE_TO_FORM_FILENAME = {
     "48 MONTHWC": "ASQ_48_Months",
 }
 
+# Appointments at these facilities are excluded from this clinic's filtered
+# schedule - Lone Star Pediatrics Midlothian is handled by its own separate
+# automation project now, so it must not be double-processed here. Compared
+# case-insensitively with leading/trailing whitespace stripped.
+EXCLUDED_FACILITY_NAMES = {"lone star pediatrics midlothian"}
+
+# TEMPORARY (demo-only, this file only - main.py never calls
+# is_demo_patient at all): the actual test schedule provided by the
+# clinic has NO "test" / "<N> year test" values in Visit Reason at all
+# (real clinical-looking text like "* 3 YEAR WELL CHILD CHECK" instead),
+# so Visit-Reason-based identification is off for now. Set back to True
+# once test patients carry a real Visit Reason marker again.
+REQUIRE_VISIT_REASON_FOR_DEMO = False
+
+# EXPLICIT allowlist of known test-patient account numbers - the ONLY
+# patients this demo pipeline will ever touch, regardless of how many
+# other real patients are on the live schedule. Facility-exclusion alone
+# is NOT sufficient here: against the real multi-day schedule (~180
+# appointments), "not Lone Star + valid Well-Check visit type" matched 8
+# real patients, not just the 2 intended test ones. Update this set as
+# the actual test patients change; leave empty to process nothing.
+DEMO_TEST_ACCOUNT_NUMBERS = {"54413", "55384"}  # Caden Motheral, Riley Lyons
+
+# TEMPORARY TESTING SWITCH (this file only - main.py is untouched): skip
+# the live eCW login/export and read a fixed test Excel instead, so the
+# PFN/PCareLink/download/upload steps can be iterated on quickly without
+# waiting through the eCW report every time. Set back to False (the
+# normal/default behavior) to resume starting from a fresh eCW export.
+TESTING_SKIP_ECW_EXPORT = True
+TESTING_EXCEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_patient_schedule.xlsx")
+
+# TEMPORARY TESTING SWITCH (this file only - main.py's state tracking is
+# untouched): reset DEMO_TEST_ACCOUNT_NUMBERS' state_db records at the
+# start of each run, so repeated testing against the same patients isn't
+# blocked by "already processed" bookkeeping from a prior run. Set to
+# False to restore normal state-tracking for this demo file too.
+TESTING_RESET_DEMO_STATE = True
+
 # ─────────────────────────────────────────
 # SHARED HELPERS
 # ─────────────────────────────────────────
@@ -106,8 +144,16 @@ def read_patients_from_excel():
         appointment_date_raw = row[col["Appointment Date"]]
         if not acct_no:
             continue
-        if not is_demo_patient(visit_reason):
+        if "Appointment Facility Name" in col:
+            facility_name_raw = row[col["Appointment Facility Name"]]
+            if facility_name_raw and str(facility_name_raw).strip().lower() in EXCLUDED_FACILITY_NAMES:
+                print(f"Skipping {last_name} {first_name} - excluded facility: {facility_name_raw!r}")
+                continue
+        if REQUIRE_VISIT_REASON_FOR_DEMO and not is_demo_patient(visit_reason):
             print(f"Skipping {last_name} {first_name} - not a demo test patient (reason: {visit_reason!r})")
+            continue
+        if str(acct_no).strip() not in DEMO_TEST_ACCOUNT_NUMBERS:
+            print(f"Skipping {last_name} {first_name} - acct {acct_no} not in DEMO_TEST_ACCOUNT_NUMBERS")
             continue
         visit_type_desc = str(visit_type_raw).split(":")[-1].strip().upper() if visit_type_raw else ""
         form_name = VISIT_TYPE_TO_FORM.get(visit_type_desc, None)
@@ -796,11 +842,23 @@ async def _go_to_search(page):
 # ─────────────────────────────────────────
 
 async def main():
+    global EXCEL_PATH
+
     print("="*50)
     print("DEMO PIPELINE — TEST PATIENT ONLY")
     print("="*50)
 
-    await ecw_export_schedule()
+    if TESTING_RESET_DEMO_STATE:
+        deleted = state_db.delete_by_acct_no(DEMO_TEST_ACCOUNT_NUMBERS)
+        if deleted:
+            print(f"TESTING MODE: reset {deleted} prior state record(s) for demo test patients")
+
+    if TESTING_SKIP_ECW_EXPORT:
+        print("\nTESTING MODE: skipping eCW login/export - reading fixed test Excel instead:")
+        print(f"  {TESTING_EXCEL_PATH}")
+        EXCEL_PATH = TESTING_EXCEL_PATH
+    else:
+        await ecw_export_schedule()
 
     exported_patients = read_patients_from_excel()
     print(f"\nFound {len(exported_patients)} demo test patients in this export")
