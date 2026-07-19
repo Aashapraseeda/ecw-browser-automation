@@ -90,15 +90,6 @@ EXCLUDED_FACILITY_NAMES = {"lone star pediatrics midlothian"}
 # once test patients carry a real Visit Reason marker again.
 REQUIRE_VISIT_REASON_FOR_DEMO = False
 
-# EXPLICIT allowlist of known test-patient account numbers - the ONLY
-# patients this demo pipeline will ever touch, regardless of how many
-# other real patients are on the live schedule. Facility-exclusion alone
-# is NOT sufficient here: against the real multi-day schedule (~180
-# appointments), "not Lone Star + valid Well-Check visit type" matched 8
-# real patients, not just the 2 intended test ones. Update this set as
-# the actual test patients change; leave empty to process nothing.
-DEMO_TEST_ACCOUNT_NUMBERS = {"54413", "55384"}  # Caden Motheral, Riley Lyons
-
 # TEMPORARY TESTING SWITCH (this file only - main.py is untouched): skip
 # the live eCW login/export and read a fixed test Excel instead, so the
 # PFN/PCareLink/download/upload steps can be iterated on quickly without
@@ -108,10 +99,10 @@ TESTING_SKIP_ECW_EXPORT = True
 TESTING_EXCEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_patient_schedule.xlsx")
 
 # TEMPORARY TESTING SWITCH (this file only - main.py's state tracking is
-# untouched): reset DEMO_TEST_ACCOUNT_NUMBERS' state_db records at the
-# start of each run, so repeated testing against the same patients isn't
-# blocked by "already processed" bookkeeping from a prior run. Set to
-# False to restore normal state-tracking for this demo file too.
+# untouched): reset state_db records for whichever patients this run's
+# filtering identifies, so repeated testing isn't blocked by "already
+# processed" bookkeeping from a prior run. Set to False to restore normal
+# state-tracking for this demo file too.
 TESTING_RESET_DEMO_STATE = True
 
 # ─────────────────────────────────────────
@@ -151,9 +142,6 @@ def read_patients_from_excel():
                 continue
         if REQUIRE_VISIT_REASON_FOR_DEMO and not is_demo_patient(visit_reason):
             print(f"Skipping {last_name} {first_name} - not a demo test patient (reason: {visit_reason!r})")
-            continue
-        if str(acct_no).strip() not in DEMO_TEST_ACCOUNT_NUMBERS:
-            print(f"Skipping {last_name} {first_name} - acct {acct_no} not in DEMO_TEST_ACCOUNT_NUMBERS")
             continue
         visit_type_desc = str(visit_type_raw).split(":")[-1].strip().upper() if visit_type_raw else ""
         form_name = VISIT_TYPE_TO_FORM.get(visit_type_desc, None)
@@ -848,11 +836,6 @@ async def main():
     print("DEMO PIPELINE — TEST PATIENT ONLY")
     print("="*50)
 
-    if TESTING_RESET_DEMO_STATE:
-        deleted = state_db.delete_by_acct_no(DEMO_TEST_ACCOUNT_NUMBERS)
-        if deleted:
-            print(f"TESTING MODE: reset {deleted} prior state record(s) for demo test patients")
-
     if TESTING_SKIP_ECW_EXPORT:
         print("\nTESTING MODE: skipping eCW login/export - reading fixed test Excel instead:")
         print(f"  {TESTING_EXCEL_PATH}")
@@ -862,6 +845,12 @@ async def main():
 
     exported_patients = read_patients_from_excel()
     print(f"\nFound {len(exported_patients)} demo test patients in this export")
+
+    if TESTING_RESET_DEMO_STATE:
+        acct_numbers = {p["acct_no"] for p in exported_patients}
+        deleted = state_db.delete_by_acct_no(acct_numbers)
+        if deleted:
+            print(f"TESTING MODE: reset {deleted} prior state record(s) for this run's patients")
 
     # --- Split into new vs already-processed (by acct_no + appointment_date) ---
     new_patients = [
