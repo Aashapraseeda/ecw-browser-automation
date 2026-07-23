@@ -33,7 +33,7 @@ async def _go_to_search(page):
     except Exception:
         pass
     await page.wait_for_selector("#jellybean-panelLink65", timeout=30000)
-    await page.locator("#jellybean-panelLink65").click()
+    await page.locator("#jellybean-panelLink65").click(force=True)
     await page.get_by_role("textbox", name="Last Name, First Name").wait_for(timeout=30000)
 
 
@@ -50,7 +50,7 @@ async def run(patients):
         await ecw_login(page)
 
         await page.wait_for_selector("#jellybean-panelLink65", timeout=30000)
-        await page.locator("#jellybean-panelLink65").click()
+        await page.locator("#jellybean-panelLink65").click(force=True)
         await page.get_by_role("textbox", name="Last Name, First Name").wait_for(timeout=30000)
         log.info("Patient search ready!")
 

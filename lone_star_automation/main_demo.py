@@ -180,6 +180,7 @@ def read_demo_patients_from_excel(excel_path):
         first_name = row[col["Patient First Name"]]
         visit_type_raw = row[col["Visit Type"]]
         appointment_date_raw = row[col["Appointment Date"]]
+        facility_raw = row[col["Appointment Facility Name"]] if "Appointment Facility Name" in col else None
         if not acct_no:
             continue
         acct_no_norm = str(acct_no).strip()
@@ -199,8 +200,15 @@ def read_demo_patients_from_excel(excel_path):
             "folder_name": f"{last_name} {first_name}_doc".strip(),
             "search_name": f"{last_name},{first_name}".strip(),
             "visit_type": visit_type_desc,
+            # (2026-07-22) wrapped in a single-element "forms" list purely
+            # for compatibility with form_sender's now-shared multi-form
+            # send mechanics (_send_forms_for_open_patient) - demo's own
+            # Visit-Type-text-based form CHOICE is unchanged, still exactly
+            # one ASQ form, no M-CHAT/TB logic here.
+            "forms": [{"form_name": form_name, "form_filename": form_filename}],
             "form_name": form_name,
             "form_filename": form_filename,
+            "facility": str(facility_raw).strip() if facility_raw else "",
         })
     return patients
 
@@ -209,9 +217,9 @@ async def send_forms_via_excel_visit_type(page, patients):
     """
     DEMO-ONLY: PFN is used only to locate each patient (search by account
     number) and send the form already determined from the Excel - reuses
-    form_sender._send_form_for_open_patient() for the actual send step
+    form_sender._send_forms_for_open_patient() for the actual send step
     (identical "+ Send a form" -> checkbox -> "Send form" flow used by
-    the PFN-table approach).
+    the PFN-table approach, now shared with production's multi-form path).
     """
     sent_patients = []
     for patient in patients:
@@ -226,8 +234,8 @@ async def send_forms_via_excel_visit_type(page, patients):
             except Exception:
                 log.info(f"Patient {patient['acct_no']} not found in PFN - skipping")
                 continue
-            sent_ok = await form_sender._send_form_for_open_patient(page, patient)
-            if sent_ok:
+            sent_forms = await form_sender._send_forms_for_open_patient(page, patient)
+            if sent_forms:
                 sent_patients.append(patient)
         except Exception as e:
             log.info(f"Error: {e}")

@@ -4,7 +4,7 @@ import re
 import glob
 import json
 import openpyxl
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright
 
@@ -15,6 +15,8 @@ load_dotenv()
 # --- CREDENTIALS ---
 ECW_USERNAME = os.getenv("ECW_USERNAME")
 ECW_PASSWORD = os.getenv("ECW_PASSWORD")
+ECW_LOGIN_URL = os.getenv("ECW_LOGIN_URL", "https://txsnmbapp.ecwcloud.com/mobiledoc/jsp/webemr/login/newLogin.jsp")
+ECW_EBO_HOME_URL = os.getenv("ECW_EBO_HOME_URL", "https://txsnmbebo.ecwcloud.com/bi/?perspective=home")
 PEDIFORMS_ORG = os.getenv("PEDIFORMS_ORG")
 PEDIFORMS_EMAIL = os.getenv("PEDIFORMS_EMAIL")
 PEDIFORMS_PASSWORD = os.getenv("PEDIFORMS_PASSWORD")
@@ -80,11 +82,175 @@ VISIT_TYPE_TO_FORM_FILENAME = {
     "48 MONTHWC": "ASQ_48_Months",
 }
 
+# --- M-CHAT + TB (2026-07-22 addition) ---
+# M-CHAT is sent ALONGSIDE the age-appropriate ASQ form (never instead of
+# it) for these visit-type KEYS only - NOT gated on the resolved form
+# NAME, because VISIT_TYPE_TO_FORM deliberately maps BOTH "15 MONTH WC"
+# and "18 MONTH WC" to the same form text ("ASQ 18 Months" - the 15-month
+# bracket reuses the 18-month form) - gating on form name would wrongly
+# also trigger M-CHAT for genuine 15-month visits.
+MCHAT_TRIGGER_VISIT_TYPES = {"18 MONTH WC", "18 MONTHWC", "24 MONTH WC", "24 MONTHWC", "2 YEAR WC"}
+MCHAT_FORM = {"form_name": "M-Chat", "form_filename": "M_Chat"}
+
+# TB form: every Well Check patient aged 12 months - 18 years inclusive
+# gets a TB form, INDEPENDENT of ASQ/M-CHAT eligibility - e.g. a 5-year-old
+# Well Check gets TB only (no ASQ form exists for that age, so previously
+# such patients were excluded entirely - see _forms_for_patient below).
+TB_MIN_AGE_MONTHS = 12
+TB_MAX_AGE_MONTHS = 18 * 12  # 216 - "18 years inclusive"
+TB_FORM = {"form_name": "TB", "form_filename": "TB"}
+
+# "TB" and "M-Chat" (mixed case, not "M-CHAT") were CONFIRMED LIVE
+# (2026-07-22, read-only inspection, no forms sent) against Lone Star's
+# Patient Forms Now account. This project's OWN Pediforms account
+# (admin.pediformpro.com) could NOT be independently checked in the same
+# session - the demo test patient couldn't be located due to a pre-existing,
+# unrelated week-filter/date-rollover issue (blocks chart access, not new).
+# Applying the same label text here is a reasonable INFERENCE (identical
+# UI text/flow observed everywhere else across both accounts - same
+# "+ Send a form", "Send form", "← Back to today's patients" wording -
+# strongly suggests the same underlying product), but is NOT independently
+# confirmed for this specific account. If the real text differs, the send
+# step's has_text=... filter will simply not find a match, log "Form not
+# found - skipping", and move on without crashing - but that form will
+# silently never be sent until confirmed and corrected here.
+#
+# Multi-select: CONFIRMED on Lone Star's account that the checkbox panel
+# supports checking several forms before one combined Send click (see
+# lone_star_automation/config/settings.py for detail). pediforms_send_forms()
+# below now checks every applicable box once and sends once, applying the
+# same inference to this account for the same reason as above.
+
+
+def _parse_date_flexible(value):
+    """
+    Local port of lone_star_automation/utils/date_utils.py's
+    parse_date_flexible() - this project has no shared date-utils module,
+    so this is intentionally duplicated rather than cross-imported from
+    the separate Lone Star project.
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    text = str(value).strip()
+    if not text:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d", "%m/%d/%Y %H:%M", "%m/%d/%Y", "%m/%d/%y", "%B %d, %Y", "%b %d, %Y"):
+        try:
+            return datetime.strptime(text, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _age_in_months(dob, reference_date):
+    """Local port of lone_star_automation's age_in_months() - see note above."""
+    months = (reference_date.year - dob.year) * 12 + (reference_date.month - dob.month)
+    if reference_date.day < dob.day:
+        months -= 1
+    return months
+
+
+async def _wait_for_loading_overlay_gone(page, timeout_ms=60000, retries=3):
+    """
+    (2026-07-23 fix) Robust wait for eCW's '#load' ("Building your user
+    experience") overlay to be hidden. A single wait_for_selector(state=
+    'hidden') call can resolve or except prematurely if the overlay
+    toggles visibility multiple times during a complex page load - a live
+    production run showed the overlay still intercepting pointer events on
+    the very next click, well after the code had already logged "Loading
+    screen already hidden!" (a bare except was silently assuming that
+    meant done, which the same run disproved). Retries a few times rather
+    than trusting one shot / one silent except.
+    """
+    for attempt in range(retries):
+        try:
+            await page.wait_for_selector('#load', state='hidden', timeout=timeout_ms)
+            print("Loading overlay confirmed hidden.")
+            return
+        except Exception:
+            print(f"Loading overlay still present or check unstable (attempt {attempt + 1}/{retries}) - re-checking...")
+            await asyncio.sleep(2)
+    print("Proceeding despite loading-overlay uncertainty after retries.")
+
+
+def _forms_for_patient(visit_type_desc, age_months):
+    """
+    Returns the list of {"form_name","form_filename"} dicts this Well
+    Check patient should receive - three independent rules:
+      1. ASQ - existing VISIT_TYPE_TO_FORM/VISIT_TYPE_TO_FORM_FILENAME
+         text-based lookup, UNCHANGED (still the sole source of ASQ
+         eligibility/form choice - preserves the existing, proven rule).
+      2. M-CHAT - additional, sent alongside ASQ only when the resolved
+         ASQ form is the 18 or 24 month one (never instead of ASQ).
+      3. TB - independent age test (12-216 months inclusive, from DOB) -
+         applies even when no ASQ form matched (e.g. a 5-year-old Well
+         Check, previously excluded entirely since VISIT_TYPE_TO_FORM has
+         no entry for it).
+    Returns [] if none apply - caller should treat that as "not eligible",
+    same as before.
+    """
+    forms = []
+    form_name = VISIT_TYPE_TO_FORM.get(visit_type_desc)
+    if form_name:
+        forms.append({
+            "form_name": form_name,
+            "form_filename": VISIT_TYPE_TO_FORM_FILENAME.get(visit_type_desc, "form"),
+        })
+        if visit_type_desc in MCHAT_TRIGGER_VISIT_TYPES:
+            forms.append(dict(MCHAT_FORM))
+    if age_months is not None and TB_MIN_AGE_MONTHS <= age_months <= TB_MAX_AGE_MONTHS:
+        forms.append(dict(TB_FORM))
+    return forms
+
 # Appointments at these facilities are excluded from this clinic's filtered
 # schedule - Lone Star Pediatrics Midlothian is handled by its own separate
 # automation project now, so it must not be double-processed here. Compared
 # case-insensitively with leading/trailing whitespace stripped.
 EXCLUDED_FACILITY_NAMES = {"lone star pediatrics midlothian"}
+
+# (2026-07-21) Maps eCW's raw "Appointment Facility Name" values to the
+# practice name shown in ReachMyDr/PCareLink's "Filter by Practice"
+# dropdown. One shared PCareLink account (aasha@painmedpa.com) covers all
+# of these practices, so the correct filter now depends on each PATIENT's
+# own facility, not a single fixed value. Keys are normalized (stripped +
+# lowercased) before lookup.
+#
+# Exact string matches between the real downloaded Excel and a live,
+# read-only ReachMyDr dropdown check, plus one explicitly-confirmed
+# ambiguous case:
+#   'Peds Center of Round Rock PA' had no exact match - two distinct,
+#   separately-clickable ReachMyDr entries could apply ("Pediatric Center
+#   Of Round Rock" vs "Ped Center Of Round Rock"); confirmed by the
+#   clinic to be "Ped Center Of Round Rock".
+#
+# DELIBERATELY LEFT UNMAPPED (not ambiguous, just not set up in ReachMyDr
+# yet - do not guess):
+#   'Lone Star Pediatrics Midlothian' - matches ZERO entries in the
+#   ReachMyDr dropdown (confirmed live). Not applicable to this project
+#   anyway (excluded via EXCLUDED_FACILITY_NAMES above), relevant only to
+#   the Lone Star project.
+FACILITY_TO_PRACTICE = {
+    "river ridge pediatrics": "River Ridge Pediatrics",
+    "peds center of round rock pa": "Ped Center Of Round Rock",
+    "elgin pediatrics": "Elgin Pediatrics",
+    "pediatric care of austin": "Pediatric Care of Austin",
+    "pediatric center of north austin": "Pediatric Center of North Austin",
+}
+
+
+def resolve_practice_for_facility(facility_name):
+    """
+    Returns the ReachMyDr practice name for a given eCW facility value, or
+    None if unmapped. Callers must log a warning and SKIP the message when
+    this returns None - never fall back to a default/guessed practice.
+    """
+    if not facility_name:
+        return None
+    return FACILITY_TO_PRACTICE.get(str(facility_name).strip().lower())
 
 # ─────────────────────────────────────────
 # SHARED HELPERS
@@ -92,8 +258,12 @@ EXCLUDED_FACILITY_NAMES = {"lone star pediatrics midlothian"}
 
 def read_patients_from_excel():
     """
-    Production filter: all patients with 9-48 month WC visit types.
-    No visit reason filter — all ASQ-eligible patients included.
+    Production filter: Well Check visits get ASQ (9-48mo, VISIT_TYPE_TO_FORM
+    text-based, unchanged), plus M-CHAT (18/24mo ASQ only) and/or TB
+    (12mo-18yr, DOB-based, independent of ASQ) - see _forms_for_patient().
+    A patient is included if EITHER an ASQ form OR TB applies (a 5+ year
+    Well Check with no ASQ form still qualifies for TB alone).
+    No visit reason filter — all eligible patients included.
     Excludes EXCLUDED_FACILITY_NAMES (see above) before any other filtering.
     """
     wb = openpyxl.load_workbook(EXCEL_PATH, read_only=True)
@@ -108,19 +278,30 @@ def read_patients_from_excel():
         first_name = row[col["Patient First Name"]]
         visit_type_raw = row[col["Visit Type"]]
         appointment_date_raw = row[col["Appointment Date"]]
+        dob_raw = row[col["Patient DOB"]] if "Patient DOB" in col else None
         if not acct_no:
             continue
-        if "Appointment Facility Name" in col:
-            facility_name_raw = row[col["Appointment Facility Name"]]
-            if facility_name_raw and str(facility_name_raw).strip().lower() in EXCLUDED_FACILITY_NAMES:
-                print(f"Skipping {last_name} {first_name} - excluded facility: {facility_name_raw!r}")
-                continue
-        visit_type_desc = str(visit_type_raw).split(":")[-1].strip().upper() if visit_type_raw else ""
-        form_name = VISIT_TYPE_TO_FORM.get(visit_type_desc, None)
-        form_filename = VISIT_TYPE_TO_FORM_FILENAME.get(visit_type_desc, "form")
-        if not form_name:
-            print(f"Skipping {last_name} {first_name} - no ASQ form for visit type: {visit_type_desc!r}")
+        facility_name_raw = row[col["Appointment Facility Name"]] if "Appointment Facility Name" in col else None
+        if facility_name_raw and str(facility_name_raw).strip().lower() in EXCLUDED_FACILITY_NAMES:
+            print(f"Skipping {last_name} {first_name} - excluded facility: {facility_name_raw!r}")
             continue
+
+        visit_type_desc = str(visit_type_raw).split(":")[-1].strip().upper() if visit_type_raw else ""
+        is_well_check = visit_type_desc.endswith(" WC") or visit_type_desc == "WC"
+        if not is_well_check:
+            print(f"Skipping {last_name} {first_name} - not a Well Check visit type: {visit_type_desc!r}")
+            continue
+
+        dob = _parse_date_flexible(dob_raw)
+        appt_date = _parse_date_flexible(appointment_date_raw)
+        age_months = _age_in_months(dob, appt_date) if dob and appt_date else None
+
+        forms = _forms_for_patient(visit_type_desc, age_months)
+        if not forms:
+            print(f"Skipping {last_name} {first_name} - no ASQ/M-CHAT/TB form applies "
+                  f"(visit type {visit_type_desc!r}, age {age_months} month(s))")
+            continue
+
         patients.append({
             "acct_no": str(acct_no).strip(),
             "appointment_date": state_db.normalize_date(appointment_date_raw),
@@ -129,8 +310,10 @@ def read_patients_from_excel():
             "folder_name": f"{last_name} {first_name}_doc".strip(),
             "search_name": f"{last_name},{first_name}".strip(),
             "visit_type": visit_type_desc,
-            "form_name": form_name,
-            "form_filename": form_filename,
+            "forms": forms,
+            "form_name": ", ".join(f["form_name"] for f in forms),
+            "form_filename": "_".join(f["form_filename"] for f in forms),
+            "facility": str(facility_name_raw).strip() if facility_name_raw else "",
         })
         filtered_rows.append(row)
 
@@ -155,34 +338,78 @@ def ensure_patient_folder(patient):
 # STEP 0 — ECW: EXPORT SCHEDULE
 # ─────────────────────────────────────────
 
-async def click_calendar_option(iframe, day_str, descriptions_to_try, label):
-    """Try clicking calendar option with multiple description variants then fallback."""
-    for desc in descriptions_to_try:
-        try:
-            await iframe.get_by_role("option", name=day_str, description=desc, exact=True).click(timeout=5000)
-            print(f"{label} date set! (description='{desc}')")
-            return
-        except:
-            pass
-    # Final fallback - no description
+async def _wait_for_report_running_modal_gone(page1, max_checks=90):
+    """
+    Waits out eCW's "Your report is running" modal (a leftover/queued
+    report execution, from this account's own prior report requests,
+    still processing server-side). This modal sits on top of the whole
+    report screen and blocks every click underneath it - including the
+    date picker - which can look exactly like an unrelated UI bug if you
+    only check for it once, early, and it appears again later.
+    """
     try:
-        await iframe.get_by_role("option", name=day_str, exact=True).first.click(timeout=5000)
-        print(f"{label} date set! (no description fallback)")
-        return
-    except Exception as e:
-        raise RuntimeError(f"Could not set {label} date to day {day_str}: {e}")
+        if await page1.get_by_text("Your report is running").is_visible():
+            print("Report already running - waiting...")
+            for i in range(max_checks):
+                if not await page1.get_by_text("Your report is running").is_visible():
+                    print("Report finished.")
+                    return
+                print(f"Still running... ({i + 1}/{max_checks})")
+                await asyncio.sleep(2)
+            print("Report still running after max wait - proceeding anyway.")
+    except:
+        pass
+
+
+async def click_calendar_option(iframe, day_str, descriptions_to_try, label, retries=3):
+    """
+    Try clicking calendar option with multiple description variants then
+    fallback.
+
+    (2026-07-24) Live diagnostics on Lone Star's identical code confirmed
+    the day option itself is genuinely visible, enabled, and has a real
+    bounding box when this fails - the click is blocked by something
+    transiently overlapping it, not a missing/broken element. Same
+    pattern already solved elsewhere in this codebase family (the
+    Facility tab click in lone_star_automation/ecw/facility_filter.py) -
+    force=True bypasses Playwright's actionability/overlap check and
+    clicks the element's coordinates directly. Outer retry/wait loop kept
+    as a second layer in case the widget is still mid-render.
+    """
+    last_error = None
+    for attempt in range(retries):
+        for desc in descriptions_to_try:
+            try:
+                await iframe.get_by_role("option", name=day_str, description=desc, exact=True).click(timeout=5000, force=True)
+                print(f"{label} date set! (description='{desc}')")
+                return
+            except:
+                pass
+        # Final fallback - no description
+        try:
+            await iframe.get_by_role("option", name=day_str, exact=True).first.click(timeout=5000, force=True)
+            print(f"{label} date set! (no description fallback)")
+            return
+        except Exception as e:
+            last_error = e
+            print(f"Could not click {label} date option (attempt {attempt + 1}/{retries}) - retrying...")
+            await asyncio.sleep(2)
+    raise RuntimeError(f"Could not set {label} date to day {day_str} after {retries} attempts: {last_error}")
 
 async def ecw_export_schedule():
     print("\n" + "="*50)
-    print("STEP 0 — ECW: EXPORTING SCHEDULE (TODAY + 7 DAYS)")
+    print("STEP 0 — ECW: EXPORTING SCHEDULE (TOMORROW THROUGH +3 DAYS)")
     print("="*50)
 
     # Both 2-letter and 3-letter day description variants
     day_desc_2 = {0: "Mo", 1: "Tu", 2: "We", 3: "Th", 4: "Fr", 5: "Sa", 6: "Su"}
     day_desc_3 = {0: "Mon", 1: "Tue", 2: "Wed", 3: "Thu", 4: "Fri", 5: "Sat", 6: "Sun"}
 
-    start_date = date.today()
-    end_date = start_date + timedelta(days=7)
+    # (2026-07-21) Changed from a 7-day window starting today to a 3-day
+    # window starting tomorrow, per explicit request - report should never
+    # include today's appointments, only tomorrow through +3 days.
+    start_date = date.today() + timedelta(days=1)
+    end_date = date.today() + timedelta(days=3)
     start_day_str = str(start_date.day)
     end_day_str = str(end_date.day)
     start_descs = [day_desc_2[start_date.weekday()], day_desc_3[start_date.weekday()]]
@@ -197,7 +424,7 @@ async def ecw_export_schedule():
         # --- LOGIN ---
         print("Logging into eCW...")
         await page.goto(
-            "https://txsnmbapp.ecwcloud.com/mobiledoc/jsp/webemr/login/newLogin.jsp",
+            ECW_LOGIN_URL,
             timeout=120000, wait_until="domcontentloaded"
         )
         await asyncio.sleep(3)
@@ -213,11 +440,7 @@ async def ecw_export_schedule():
         print("Home page loaded!")
 
         print("Waiting for eCW to fully load...")
-        try:
-            await page.wait_for_selector('#load', state='hidden', timeout=120000)
-            print("eCW fully loaded!")
-        except:
-            print("Loading screen already hidden!")
+        await _wait_for_loading_overlay_gone(page)
 
         print("Checking for License Alert...")
         dismissed = False
@@ -235,20 +458,31 @@ async def ecw_export_schedule():
             print("No License Alert, continuing...")
         await asyncio.sleep(2)
 
+        # Re-verify right before the next click - the overlay can
+        # re-render asynchronously after the first check passes (see
+        # _wait_for_loading_overlay_gone's docstring).
+        await _wait_for_loading_overlay_gone(page)
+
         # --- NAVIGATE TO EBO REPORTS ---
+        # (2026-07-24) force=True on these: live runs showed different
+        # transient backdrop elements (e.g. #pnBackDrop, seen even after
+        # the loading overlay was already confirmed hidden) intermittently
+        # blocking these clicks - a different element each time, not the
+        # same bug recurring. Same fix already proven for the calendar day
+        # click and the Facility tab click on Lone Star's identical code.
         print("Navigating to eBO Reports...")
-        await page.locator("#jellybean-panelLink4").click()
+        await page.locator("#jellybean-panelLink4").click(force=True)
         await asyncio.sleep(1)
-        await page.get_by_text("Menu", exact=True).click()
+        await page.get_by_text("Menu", exact=True).click(force=True)
         await asyncio.sleep(1)
-        await page.locator("#pane6").get_by_text("Reports").click()
+        await page.locator("#pane6").get_by_text("Reports").click(force=True)
         await asyncio.sleep(1)
 
         async with page.expect_popup(timeout=60000) as page1_info:
             await page.get_by_text("eBO Reports CTRL + ALT + E").click()
         page1 = await page1_info.value
         await page1.goto(
-            "https://txsnmbebo.ecwcloud.com/bi/?perspective=home",
+            ECW_EBO_HOME_URL,
             timeout=60000, wait_until="domcontentloaded"
         )
         await asyncio.sleep(5)
@@ -264,24 +498,55 @@ async def ecw_export_schedule():
         print("Encounter Patient Download opened!")
 
         # --- WAIT IF REPORT ALREADY RUNNING ---
-        try:
-            if await page1.get_by_text("Your report is running").is_visible():
-                print("Report already running — waiting...")
-                for i in range(90):
-                    if not await page1.get_by_text("Your report is running").is_visible():
-                        print("Report finished.")
-                        break
-                    print(f"Still running... ({i+1}/90)")
-                    await asyncio.sleep(2)
-        except:
-            pass
+        await _wait_for_report_running_modal_gone(page1)
 
         # --- WAIT FOR IFRAME ---
         print("Waiting for iframe to load...")
         iframe = page1.locator("iframe[name=\"iD6D96C5E47F347C9B95828AC68A2D69B\"]").content_frame
-        await iframe.get_by_role("img").first.wait_for(timeout=60000)
-        await asyncio.sleep(3)
-        print("Iframe loaded!")
+        await iframe.get_by_role("img").first.wait_for(timeout=120000)
+
+        # (2026-07-24 fix) A live diagnostic on Lone Star's identical
+        # report screen showed the iframe's own content is unstable right
+        # after this point - images can appear then disappear again
+        # moments later as the report prompt panel (tabs: Additional
+        # Prompts / Facility / Provider / Payer / Patient / Others) keeps
+        # re-rendering. The date-range controls need TWO calendar icons
+        # (img().first for start, img().nth(1) for end) - a live run
+        # showed the count stabilizing at just 1, which the previous
+        # version of this check accepted as "done" since it only required
+        # non-zero, not the actual expected count. Now waits up to 90s
+        # (was 30) and requires the count to reach >= 2 before considering
+        # it settled - same stabilization pattern already proven for the
+        # Facility results list in lone_star_automation/ecw/facility_filter.py,
+        # now also checking for completeness, not just stability.
+        previous_count = -1
+        stable_checks = 0
+        target_reached = False
+        for _ in range(90):
+            count = await iframe.get_by_role("img").count()
+            if count >= 2 and count == previous_count:
+                stable_checks += 1
+                if stable_checks >= 3:
+                    target_reached = True
+                    break
+            else:
+                stable_checks = 0
+            previous_count = count
+            await asyncio.sleep(1)
+        if target_reached:
+            print(f"Iframe content stabilized at {previous_count} image(s).")
+        else:
+            print(f"Iframe content never reached 2+ stable images after extended wait "
+                  f"(last count: {previous_count}) - proceeding anyway.")
+
+        # (2026-07-24 fix) The "Your report is running" modal was observed
+        # live (on Lone Star's identical code) appearing AFTER the check
+        # above already passed - a report from an earlier attempt still
+        # executing/queued server-side, only surfacing once the page
+        # caught up. That modal sits on top of the date picker and blocks
+        # every click under it (including the day option), which looked
+        # like a calendar bug but wasn't - re-check right before dates.
+        await _wait_for_report_running_modal_gone(page1)
 
         # --- SET DATES ---
         print(f"Setting start date: {start_date}")
@@ -367,7 +632,13 @@ async def pediforms_send_forms(patients):
 
         for patient in patients:
             try:
-                print(f"\nSending form for {patient['acct_no']} ({patient['last_name']} {patient['first_name']})")
+                forms_to_send = patient.get("forms") or (
+                    [{"form_name": patient["form_name"], "form_filename": patient["form_filename"]}]
+                    if patient.get("form_name") else []
+                )
+                form_names = [f["form_name"] for f in forms_to_send]
+                print(f"\nSending {len(forms_to_send)} form(s) for {patient['acct_no']} "
+                      f"({patient['last_name']} {patient['first_name']}): {form_names}")
                 search_box = page.get_by_role("textbox", name="Search…")
                 await search_box.click()
                 await search_box.fill(patient["acct_no"])
@@ -377,17 +648,36 @@ async def pediforms_send_forms(patients):
                 except:
                     print(f"Patient {patient['acct_no']} not found - skipping")
                     continue
-                await page.get_by_role("button", name="+ Send a form").click()
-                await page.wait_for_timeout(500)
+
+                # (2026-07-22) sends EVERY form for this patient (ASQ +
+                # M-CHAT + TB, any combination) in ONE combined submission -
+                # opens "+ Send a form" once, checks every matching box,
+                # then clicks "Send form" once. Confirmed live on Lone
+                # Star's account that this checkbox panel supports true
+                # multi-select (see MCHAT_FORM's comment above) - applying
+                # the same flow here as a reasonable inference for this
+                # account, not independently confirmed (see same comment).
+                checked_forms = []
                 try:
-                    await page.locator("label").filter(has_text=patient["form_name"]).first.click(timeout=10000)
-                except:
-                    print(f"Form '{patient['form_name']}' not found - skipping")
-                    await page.get_by_role("link", name="← Back to today's patients").click()
-                    await page.wait_for_load_state("networkidle")
-                    continue
-                await page.get_by_role("button", name="Send form").click()
-                print(f"Sent '{patient['form_name']}' successfully!")
+                    await page.get_by_role("button", name="+ Send a form").click()
+                    await page.wait_for_timeout(500)
+
+                    for form in forms_to_send:
+                        try:
+                            await page.locator("label").filter(has_text=form["form_name"]).first.click(timeout=10000)
+                            checked_forms.append(form)
+                        except:
+                            print(f"Form '{form['form_name']}' not found - skipping")
+                            continue
+
+                    if checked_forms:
+                        await page.get_by_role("button", name="Send form").click()
+                        print(f"Sent {[f['form_name'] for f in checked_forms]} successfully!")
+                    else:
+                        print(f"No matching form checkboxes found for {patient['acct_no']} - nothing sent")
+                except Exception as e:
+                    print(f"Error sending forms: {e}")
+
                 await page.get_by_role("link", name="← Back to today's patients").click()
                 await page.wait_for_load_state("networkidle")
             except Exception as e:
@@ -429,14 +719,25 @@ async def pcarelink_send_messages(patients):
         await page.locator('[data-test-id="pcl-dashboard-popOver1"]').click()
         await page.wait_for_load_state("networkidle")
 
-        await page.get_by_role("button", name="Filter by Practice").click()
-        await page.get_by_text(f"{PCARELINK_PRACTICE}Round Rock, us").click()
-        await page.wait_for_timeout(2000)
-        print(f"Filtered by practice: {PCARELINK_PRACTICE}")
-
         for patient in patients:
             try:
+                practice = resolve_practice_for_facility(patient.get("facility"))
+
+                # --- TEMPORARY DEBUG LOGGING (per explicit request - remove once verified live) ---
+                print(f"[DEBUG] Patient: {patient['first_name']} {patient['last_name']} | "
+                      f"Facility: {patient.get('facility')!r} | Practice: {practice!r}")
+
+                if not practice:
+                    print(f"WARNING: no ReachMyDr practice mapping for facility {patient.get('facility')!r} "
+                          f"(acct {patient['acct_no']}) - skipping message, NOT guessing a practice.")
+                    continue
+
                 print(f"\nSending message for {patient['acct_no']} ({patient['last_name']} {patient['first_name']})")
+                await page.get_by_role("button", name="Filter by Practice").click()
+                await page.get_by_text(practice, exact=False).click()
+                await page.wait_for_timeout(2000)
+                print(f"Filtered by practice: {practice}")
+
                 search_box = page.get_by_role("searchbox", name="Enter patient first name or")
                 await search_box.click()
                 await search_box.fill(patient["acct_no"])
@@ -453,7 +754,7 @@ async def pcarelink_send_messages(patients):
                 await page.locator('[data-test-id="pcl-payments-sendMessageLinkGuarantorDrawer"]').click()
                 await page.wait_for_timeout(1000)
                 try:
-                    await page.get_by_role("button", name=PCARELINK_PRACTICE).click(timeout=5000)
+                    await page.get_by_role("button", name=practice).click(timeout=5000)
                     await page.wait_for_timeout(500)
                     await page.get_by_role("menuitem", name="Appointment Scheduling").get_by_role("radio").check(timeout=5000)
                     await page.locator("#menu- > div").first.click(timeout=5000)
@@ -487,8 +788,31 @@ async def pcarelink_send_messages(patients):
 async def check_and_download_completed(page, patients):
     """
     Search each patient without status filter, then check if they have
-    a Completed submission. If multiple submissions exist, click the
-    most recent Completed one and download it.
+    Completed submissions.
+
+    (2026-07-22 fix) Downloads EVERY completed submission for a patient,
+    not just the first - previously `export_buttons.first.click()` always
+    grabbed only one PDF regardless of how many completed forms existed,
+    which silently dropped M-CHAT/TB completions for multi-form patients.
+    Each submission is now matched (best-effort, via its row's text)
+    against this patient's expected form names - reconstructed from the
+    comma-joined `patient["form_name"]` already persisted at send time, no
+    state_db schema change needed - and saved under a filename derived
+    from THAT specific form's own sanitized name (e.g.
+    "Smith_John_ASQ_18_Months.pdf", "Smith_John_M_Chat.pdf",
+    "Smith_John_TB.pdf"). If a row's text can't be matched to any expected
+    form, it falls back to a generic "completed_form_N" name rather than
+    guessing a specific (possibly wrong) label. Filenames are deterministic,
+    so a submission already downloaded in a prior run is detected via
+    os.path.exists and skipped, rather than re-downloaded.
+
+    A patient is only marked 'downloaded' (state_db.mark_downloaded, which
+    hands them to the upload step) once EVERY expected form has a matching
+    file already present in their folder - a patient with e.g. ASQ done
+    but M-CHAT/TB still pending stays in 'form_sent' and is re-checked
+    again next run, rather than being finalized on a partial capture. See
+    this function's LIMITATION note at the bottom of the file for what
+    this implies if a parent never completes every expected form.
 
     Single pass only - returns the list of patients newly downloaded
     this run. Cron re-invoking this script provides the "check again
@@ -521,13 +845,10 @@ async def check_and_download_completed(page, patients):
                 await search_box.fill("")
                 continue
 
-            print(f"Patient {patient['acct_no']} has Completed form — opening...")
+            print(f"Patient {patient['acct_no']} has Completed form(s) - opening...")
             await page.get_by_role("link", name="View").first.click()
             await page.wait_for_timeout(1000)
 
-            # Handle multiple submissions — find the most recent Completed one
-            # Look for Export PDF buttons next to (completed) submissions
-            # The page shows submissions list; click Export PDF on first completed
             export_buttons = page.get_by_role("button", name="Export PDF")
             export_count = await export_buttons.count()
 
@@ -538,19 +859,60 @@ async def check_and_download_completed(page, patients):
                 continue
 
             folder_path = ensure_patient_folder(patient)
-            file_name = f"{patient['last_name']}_{patient['first_name']}_{patient['form_filename']}.pdf"
-            save_path = os.path.join(folder_path, file_name)
+            # Reconstructed from the comma-joined summary built in
+            # read_patients_from_excel() - safe to split on "," since
+            # individual form names never contain commas (unlike
+            # form_filename, which IS joined with "_" and can't be safely
+            # reverse-split since individual filenames also contain "_").
+            expected_names = [n.strip() for n in patient.get("form_name", "").split(",") if n.strip()]
 
-            print(f"Downloading most recent completed form for {patient['acct_no']}...")
-            # Click the FIRST Export PDF — Pediforms shows most recent first
-            async with page.expect_download() as download_info:
-                await export_buttons.first.click()
-            download = await download_info.value
-            await download.save_as(save_path)
-            print(f"Saved: {save_path}")
+            print(f"Found {export_count} completed submission(s) for {patient['acct_no']} - downloading all...")
+            for i in range(export_count):
+                form_label = None
+                try:
+                    row_text = await export_buttons.nth(i).locator(
+                        "xpath=ancestor::*[self::tr or self::div][1]"
+                    ).inner_text()
+                    for name in expected_names:
+                        if name.lower() in row_text.lower():
+                            form_label = name
+                            break
+                except Exception:
+                    pass
+                if form_label is None:
+                    form_label = f"completed form {i + 1}"
 
-            state_db.mark_downloaded(patient["acct_no"], patient["appointment_date"])
-            newly_downloaded.append(patient)
+                filename_part = re.sub(r"[^A-Za-z0-9]+", "_", form_label).strip("_")
+                file_name = f"{patient['last_name']}_{patient['first_name']}_{filename_part}.pdf"
+                save_path = os.path.join(folder_path, file_name)
+
+                if os.path.exists(save_path):
+                    print(f"Already downloaded: {file_name} - skipping")
+                    continue
+
+                try:
+                    print(f"Downloading completed form {i + 1}/{export_count} for {patient['acct_no']} ({form_label})...")
+                    async with page.expect_download() as download_info:
+                        await export_buttons.nth(i).click()
+                    download = await download_info.value
+                    await download.save_as(save_path)
+                    print(f"Saved: {save_path}")
+                except Exception as e:
+                    print(f"Error downloading submission {i + 1} for {patient['acct_no']}: {e}")
+                    continue
+
+            existing_files = os.listdir(folder_path) if os.path.exists(folder_path) else []
+            all_captured = all(
+                any(re.sub(r"[^A-Za-z0-9]+", "_", name).strip("_").lower() in f.lower() for f in existing_files)
+                for name in expected_names
+            ) if expected_names else len(existing_files) > 0
+
+            if all_captured:
+                state_db.mark_downloaded(patient["acct_no"], patient["appointment_date"])
+                newly_downloaded.append(patient)
+                print(f"All expected form(s) captured for {patient['acct_no']} - ready for upload.")
+            else:
+                print(f"Not all expected forms captured yet for {patient['acct_no']} - will re-check next run.")
 
             await page.get_by_role("link", name="← Back to today's patients").click()
             await page.wait_for_timeout(1000)
@@ -617,7 +979,7 @@ async def ecw_upload_forms(patients):
 
         print("Opening eCW login page...")
         await page.goto(
-            "https://txsnmbapp.ecwcloud.com/mobiledoc/jsp/webemr/login/newLogin.jsp",
+            ECW_LOGIN_URL,
             timeout=120000, wait_until="domcontentloaded"
         )
         await asyncio.sleep(3)
@@ -633,11 +995,7 @@ async def ecw_upload_forms(patients):
 
         await page.wait_for_selector('#jellybean-panelLink33', timeout=120000)
         print("Home page loaded!")
-        try:
-            await page.wait_for_selector('#load', state='hidden', timeout=120000)
-            print("eCW fully loaded!")
-        except:
-            pass
+        await _wait_for_loading_overlay_gone(page)
 
         print("Checking for License Alert...")
         dismissed = False
@@ -655,8 +1013,12 @@ async def ecw_upload_forms(patients):
             print("No License Alert, continuing...")
         await asyncio.sleep(2)
 
+        # Re-verify right before the next click - see
+        # _wait_for_loading_overlay_gone's docstring.
+        await _wait_for_loading_overlay_gone(page)
+
         await page.wait_for_selector("#jellybean-panelLink65", timeout=30000)
-        await page.locator("#jellybean-panelLink65").click()
+        await page.locator("#jellybean-panelLink65").click(force=True)
         await page.get_by_role("textbox", name="Last Name, First Name").wait_for(timeout=30000)
         print("Patient search ready!")
 
@@ -776,7 +1138,7 @@ async def _go_to_search(page):
     except:
         pass
     await page.wait_for_selector("#jellybean-panelLink65", timeout=30000)
-    await page.locator("#jellybean-panelLink65").click()
+    await page.locator("#jellybean-panelLink65").click(force=True)
     await page.get_by_role("textbox", name="Last Name, First Name").wait_for(timeout=30000)
 
 # ─────────────────────────────────────────
@@ -1241,7 +1603,7 @@ if __name__ == "__main__":
 
 #         # Open patient search
 #         await page.wait_for_selector("#jellybean-panelLink65", timeout=30000)
-#         await page.locator("#jellybean-panelLink65").click()
+#         await page.locator("#jellybean-panelLink65").click(force=True)
 #         await page.get_by_role("textbox", name="Last Name, First Name").wait_for(timeout=30000)
 #         print("Patient search ready!")
 

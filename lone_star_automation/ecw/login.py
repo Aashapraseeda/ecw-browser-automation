@@ -34,14 +34,40 @@ async def ecw_login(page):
     await page.wait_for_selector('#jellybean-panelLink33', timeout=120000)
     log.info("Home page loaded!")
 
-    log.info("Waiting for eCW to fully load...")
-    try:
-        await page.wait_for_selector('#load', state='hidden', timeout=120000)
-        log.info("eCW fully loaded!")
-    except Exception:
-        log.info("Loading screen already hidden!")
+    await _wait_for_loading_overlay_gone(page)
 
     await dismiss_license_alert(page)
+
+    # (2026-07-23 fix) The "#load" / "Building your user experience" overlay
+    # can re-render and reappear AFTER the first hidden-check resolves -
+    # eCW keeps loading asynchronously post-login/post-license-alert. A
+    # live production run showed the overlay still intercepting pointer
+    # events on the very next click (#jellybean-panelLink4), ~25+ seconds
+    # after the code had already logged "Loading screen already hidden!".
+    # Re-verify right before handing control back to callers, since they
+    # click navigation elements immediately.
+    await _wait_for_loading_overlay_gone(page)
+
+
+async def _wait_for_loading_overlay_gone(page, timeout_ms=60000, retries=3):
+    """
+    Robust wait for eCW's '#load' overlay to be hidden. A single
+    wait_for_selector(state='hidden') call can resolve or except
+    prematurely if the overlay toggles visibility multiple times during a
+    complex page load - retries a few times rather than trusting one shot
+    and silently assuming "already hidden" on any exception (that
+    assumption was directly disproved live - the overlay was still
+    blocking clicks well after the exception fired).
+    """
+    for attempt in range(retries):
+        try:
+            await page.wait_for_selector('#load', state='hidden', timeout=timeout_ms)
+            log.info("Loading overlay confirmed hidden.")
+            return
+        except Exception:
+            log.info(f"Loading overlay still present or check unstable (attempt {attempt + 1}/{retries}) - re-checking...")
+            await asyncio.sleep(2)
+    log.info("Proceeding despite loading-overlay uncertainty after retries.")
 
 
 async def dismiss_license_alert(page):

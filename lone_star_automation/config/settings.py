@@ -16,8 +16,8 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # --- eCW CREDENTIALS ---
 ECW_USERNAME = os.getenv("ECW_USERNAME")
 ECW_PASSWORD = os.getenv("ECW_PASSWORD")
-ECW_LOGIN_URL = "https://txsnmbapp.ecwcloud.com/mobiledoc/jsp/webemr/login/newLogin.jsp"
-ECW_EBO_HOME_URL = "https://txsnmbebo.ecwcloud.com/bi/?perspective=home"
+ECW_LOGIN_URL = os.getenv("ECW_LOGIN_URL", "https://txsnmbapp.ecwcloud.com/mobiledoc/jsp/webemr/login/newLogin.jsp")
+ECW_EBO_HOME_URL = os.getenv("ECW_EBO_HOME_URL", "https://txsnmbebo.ecwcloud.com/bi/?perspective=home")
 
 # --- FACILITY FILTER (Lone Star specific) ---
 FACILITY_KEYWORD = os.getenv("FACILITY_KEYWORD", "lone")
@@ -63,6 +63,38 @@ PCARELINK_PASSWORD = os.getenv("PCARELINK_PASSWORD")
 PCARELINK_PRACTICE = os.getenv("PCARELINK_PRACTICE")
 PCARELINK_MESSAGE = os.getenv("PCARELINK_MESSAGE")
 
+# (2026-07-21) Maps eCW's raw "Appointment Facility Name" values to the
+# practice name shown in ReachMyDr/PCareLink's "Filter by Practice"
+# dropdown - the same shared PCareLink account (aasha@painmedpa.com,
+# confirmed identical credentials in both projects' .env) covers all
+# practices for BOTH clinics, so the correct filter depends on each
+# PATIENT's own facility, not the fixed PCARELINK_PRACTICE value above
+# (kept only as a legacy/unused default - no longer read by
+# pcarelink/messenger.py). Keys are normalized (stripped + lowercased).
+#
+# Lone Star's own eCW export is already Facility-filtered to "Lone Star
+# Pediatrics Midlothian" only (see ecw/facility_filter.py) - confirmed via
+# a live debug run this is the ONLY facility value Lone Star patients will
+# ever have.
+#
+# (2026-07-21, update) "Lone Star Pediatrics (Midlothian)" is now
+# available in ReachMyDr's "Filter by Practice" dropdown (access issue
+# resolved by logging out/back in) - confirmed live, mapped below.
+FACILITY_TO_PRACTICE = {
+    "lone star pediatrics midlothian": "Lone Star Pediatrics (Midlothian)",
+}
+
+
+def resolve_practice_for_facility(facility_name):
+    """
+    Returns the ReachMyDr practice name for a given eCW facility value, or
+    None if unmapped. Callers must log a warning and SKIP the message when
+    this returns None - never fall back to a default/guessed practice.
+    """
+    if not facility_name:
+        return None
+    return FACILITY_TO_PRACTICE.get(str(facility_name).strip().lower())
+
 # --- PATHS ---
 EXCEL_PATH = os.getenv("EXCEL_PATH", os.path.join(BASE_DIR, "ecw_schedule.xlsx"))
 DOC_FOLDER = os.getenv("ECW_PATIENTS_DOC_FOLDER", os.path.join(BASE_DIR, "patients_doc"))
@@ -71,6 +103,36 @@ LOG_DIR = os.getenv("LOG_DIR", os.path.join(BASE_DIR, "logs"))
 
 # --- SETTINGS ---
 STATE_RETENTION_DAYS = int(os.getenv("STATE_RETENTION_DAYS", "30"))
+
+# --- WELL-CHECK VISIT TYPE DETECTION (Excel-based) ---
+# Ported from the reference clinic's (Nurture Kids) read_patients_from_excel():
+# same parsing convention - str(visit_type).split(":")[-1].strip().upper() -
+# checked for membership here. Used ONLY to answer "is this row a Well
+# Check visit?" from the eCW export's own Visit Type column - NOT to pick
+# which ASQ form to send (that stays DOB-based, see ASQ_BRACKET_TO_FORM
+# below, unchanged). Deliberately includes WC labels outside the 9-48
+# month ASQ window too (2 WEEK/2/4/6 MONTH WC, 5/8/9/12 YEAR WC) - the
+# separate age check (utils.date_utils.match_asq_bracket) is what enforces
+# the 9-48 month inclusive requirement, so "is a Well Check" and "is in
+# our supported age range" are kept as two independent conditions, exactly
+# as specified.
+#
+# Confirmed against real Lone Star data via a live debug run (2026-07-21):
+# eCW's Visit Type column literally contains these labels for Lone Star's
+# schedule (e.g. "9 MONTH WC : 9 MONTH WC", "18 MONTHWC : 18 MONTH WC") -
+# Patient Forms Now's OWN "Visit type" column does NOT (it only ever
+# showed "New patient" / "Follow-up" / "Sick visit" - a generic
+# patient-status field, not a clinical visit type), which is why
+# eligibility must be determined from the Excel now, not from PFN.
+WELL_CHECK_VISIT_TYPES = {
+    "2 WEEK WC", "2 MONTH WC", "4 MONTH WC", "6 MONTH WC",
+    "9 MONTH WC", "12 MONTH WC", "12 MONTHWC", "1 YEAR WC",
+    "15 MONTH WC", "15 MONTHWC", "18 MONTH WC", "18 MONTHWC",
+    "24 MONTH WC", "24 MONTHWC", "2 YEAR WC",
+    "30 MONTH WC", "30 MONTHWC", "3 YEAR WC", "36 MONTH WC", "36 MONTHWC",
+    "4 YEAR WC", "48 MONTH WC", "48 MONTHWC",
+    "5 YEAR WC", "8 YEAR WC", "9 YEAR WC", "12 YEAR WC",
+}
 
 # --- ASQ AGE BRACKETS (DOB-based) ---
 # Lone Star's Patient Forms Now table does NOT encode age in the Visit
@@ -100,3 +162,32 @@ ASQ_BRACKET_TO_FORM = {
     36: ("ASQ-36 Months", "ASQ_36_Months"),
     48: ("ASQ 48 Months", "ASQ_48_Months"),
 }
+
+# --- M-CHAT + TB (2026-07-22 addition) ---
+# M-CHAT is sent ALONGSIDE the age-appropriate ASQ form (never instead of
+# it) for these two ASQ brackets only.
+MCHAT_ASQ_BRACKETS = {18, 24}
+MCHAT_FORM = {"form_name": "M-Chat", "form_filename": "M_Chat"}
+
+# TB form: every Well Check patient aged 12 months - 18 years inclusive
+# gets a TB form, INDEPENDENT of ASQ/M-CHAT eligibility - e.g. a 5-year-old
+# Well Check gets TB only (no ASQ form exists for that age, so previously
+# such patients were excluded entirely - see form_sender.forms_for_well_check).
+TB_MIN_AGE_MONTHS = 12
+TB_MAX_AGE_MONTHS = 18 * 12  # 216 - "18 years inclusive"
+TB_FORM = {"form_name": "TB", "form_filename": "TB"}
+
+# CONFIRMED LIVE (2026-07-22, read-only inspection - no forms sent): the
+# real "+ Send a form" checkbox panel lists these exact labels among
+# others (ASQ-9/12/18/24/30/36 Months, "ASQ 48 Months", CRAFFT-21, EPDS,
+# LEAD, M-Chat, TB). "TB" matched the original guess exactly; "M-Chat"
+# (mixed case) replaces the earlier "M-CHAT" guess - functionally
+# Playwright's has_text matching is case-insensitive so the old value
+# likely still would have worked, but this is now the verified real text.
+# ALSO CONFIRMED: the panel supports true multi-select - checking
+# ASQ-9 Months, then M-Chat, then TB left all three checked
+# simultaneously (verified via each checkbox's is_checked() state,
+# without ever clicking "Send form"). See
+# patient_forms_now/form_sender.py's _send_forms_for_open_patient(),
+# which now checks every applicable box once and sends once, rather than
+# reopening the panel per form.

@@ -8,13 +8,17 @@ these workflow changes:
   1. eCW schedule export applies a Facility filter (Lone Star Pediatrics
      Midlothian), inserted after the date range is set - see
      ecw/facility_filter.py.
-  2. The full (unfiltered) export is imported into Patient Forms Now, and
-     Well-Check eligibility is decided INSIDE Patient Forms Now from the
-     imported table's own Visit Type + DOB + Appointment columns - NOT by
-     reading the local Excel in Python, and NOT by assuming Visit Type
-     encodes age (Lone Star's Visit Type is generic, e.g. "New patient" -
-     age is computed from DOB instead). See patient_forms_now/form_sender.py's
-     module docstring for the full explanation.
+  2. **(2026-07-21) Well-Check eligibility is decided from the eCW Excel
+     export itself** (patient_forms_now.form_sender.read_eligible_patients_from_excel),
+     the same way the reference clinic does it - NOT from Patient Forms
+     Now's own table. A live production debug run proved PFN's "Visit
+     type" column is a generic patient-status field ("New patient" /
+     "Follow-up" / "Sick visit"), never the clinical visit type, which is
+     why the original PFN-table approach found 0 eligible patients every
+     run. The full (unfiltered) Excel is still imported into PFN exactly
+     as before - only the source driving which patients get searched and
+     sent a form changed. See patient_forms_now/form_sender.py's module
+     docstring for the full explanation.
   3. PCareLink/ReachMyDr reminder messaging is wired in, immediately after
      a batch of forms is sent and marked form_sent - see
      pcarelink/messenger.py.
@@ -43,20 +47,34 @@ async def main():
     log.info("=" * 50)
 
     # --- STEP 0: eCW export (with Facility filter) ---
-    await schedule_export.run()
+    # (2026-07-21) tomorrow through +3 days - was a 7-day window starting today.
+    await schedule_export.run(window_days=2, start_offset_days=1)
 
-    # --- STEP 1: Patient Forms Now - import full schedule, determine
-    # Well-Check eligibility from the PFN table itself, and send forms ---
-    sent_patients = await form_sender.run(demo_only=False)
+    # --- STEP 1a: determine Well-Check eligibility from the Excel itself
+    # (Visit Type/Visit Reason + DOB-based age, 9-48 months inclusive) ---
+    exported_patients = form_sender.read_eligible_patients_from_excel(settings.EXCEL_PATH)
+    log.info(f"Found {len(exported_patients)} ASQ-eligible patients in this export")
 
-    if sent_patients:
+    new_patients = [
+        p for p in exported_patients
+        if not state_db.is_known(p["acct_no"], p["appointment_date"])
+    ]
+    already_known = len(exported_patients) - len(new_patients)
+    log.info(f"{len(new_patients)} new patient-visits, {already_known} already processed (skipping resend)")
+
+    sent_patients = []
+    if new_patients:
+        # --- STEP 1b: Patient Forms Now - import full schedule, then
+        # search + send only for the patients determined eligible above ---
+        sent_patients = await form_sender.run_from_excel_list(new_patients)
         for p in sent_patients:
             state_db.insert_form_sent(p)
 
         # --- STEP 2: PCareLink - reminder messages for patients just sent a form ---
-        await pcarelink_messenger.send_messages(sent_patients)
+        if sent_patients:
+            await pcarelink_messenger.send_messages(sent_patients)
     else:
-        log.info("No new patients had a form sent this run.")
+        log.info("No new patients to send forms to this run.")
 
     # --- STEP 3: check ALL pending patients (from DB, not just today's export) ---
     pending = state_db.get_pending_patients()
