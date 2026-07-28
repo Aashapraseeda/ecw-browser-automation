@@ -93,6 +93,12 @@ log = get_logger(__name__)
 
 _DEMO_YEAR_TEST_RE = re.compile(r"^\d+\s*year\s*test$")
 
+# The send button's visible text changes with how many forms are checked
+# ("Send Form" / "Send Forms" for 1, "Send 2 Forms", "Send 3 Forms", ...) -
+# match generically instead of one exact literal string so any future form
+# count keeps working with no code change.
+SEND_FORMS_BUTTON_RE = re.compile(r"^send\s+(\d+\s+)?forms?$", re.I)
+
 # Confirmed column positions (see module docstring)
 COL_FIRST_NAME = 0
 COL_LAST_NAME = 1
@@ -376,7 +382,7 @@ async def _send_forms_for_open_patient(page, patient):
                 continue
 
         if checked_forms:
-            await page.get_by_role("button", name="Send form").click()
+            await page.get_by_role("button", name=SEND_FORMS_BUTTON_RE).click()
             log.info(f"Sent {[f['form_name'] for f in checked_forms]} successfully!")
         else:
             log.info(f"No matching form checkboxes found for {patient['acct_no']} - nothing sent")

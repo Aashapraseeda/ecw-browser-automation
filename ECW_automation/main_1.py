@@ -12,6 +12,12 @@ import state_db
 
 load_dotenv()
 
+# The send button's visible text changes with how many forms are checked
+# ("Send Form" / "Send Forms" for 1, "Send 2 Forms", "Send 3 Forms", ...) -
+# match generically instead of one exact literal string so any future form
+# count keeps working with no code change.
+SEND_FORMS_BUTTON_RE = re.compile(r"^send\s+(\d+\s+)?forms?$", re.I)
+
 # --- CREDENTIALS ---
 ECW_USERNAME = os.getenv("ECW_USERNAME")
 ECW_PASSWORD = os.getenv("ECW_PASSWORD")
@@ -412,7 +418,7 @@ async def pediforms_send_forms(patients):
                     await page.get_by_role("link", name="← Back to today's patients").click()
                     await page.wait_for_load_state("networkidle")
                     continue
-                await page.get_by_role("button", name="Send form").click()
+                await page.get_by_role("button", name=SEND_FORMS_BUTTON_RE).click()
                 print(f"Sent '{patient['form_name']}' successfully!")
                 await page.get_by_role("link", name="← Back to today's patients").click()
                 await page.wait_for_load_state("networkidle")

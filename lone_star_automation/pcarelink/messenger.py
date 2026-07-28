@@ -53,6 +53,16 @@ async def send_messages(patients):
         await page.locator('[data-test-id="pcl-dashboard-popOver1"]').click()
         await page.wait_for_load_state("networkidle")
 
+        # The practice filter button's own visible text is NOT stable across
+        # patients: it reads "Filter by Practice" only before anything has
+        # ever been selected, then switches to showing whichever practice
+        # name was picked last (e.g. "Lone Star Pediatrics") and stays that
+        # way - it never reverts to the placeholder. Track what it's
+        # currently showing ourselves (we're the ones who set it) instead of
+        # hardcoding either the placeholder or any specific practice name,
+        # so this works for any practice, in any order, indefinitely.
+        current_filter_label = "Filter by Practice"
+
         for patient in patients:
             try:
                 practice = settings.resolve_practice_for_facility(patient.get("facility"))
@@ -67,9 +77,16 @@ async def send_messages(patients):
                     continue
 
                 log.info(f"Sending message for {patient['acct_no']} ({patient['last_name']} {patient['first_name']})")
-                await page.get_by_role("button", name="Filter by Practice").click()
+                try:
+                    await page.get_by_role("button", name=current_filter_label).click(timeout=10000)
+                except Exception:
+                    # Fallback in case our tracked label ever gets out of
+                    # sync with what's actually on screen - the placeholder
+                    # is the only other state this button can be in.
+                    await page.get_by_role("button", name="Filter by Practice").click(timeout=10000)
                 await page.get_by_text(practice, exact=False).click()
                 await page.wait_for_timeout(2000)
+                current_filter_label = practice
                 log.info(f"Filtered by practice: {practice}")
 
                 search_box = page.get_by_role("searchbox", name="Enter patient first name or")

@@ -12,6 +12,12 @@ import state_db
 
 load_dotenv()
 
+# The send button's visible text changes with how many forms are checked
+# ("Send Form" / "Send Forms" for 1, "Send 2 Forms", "Send 3 Forms", ...) -
+# match generically instead of one exact literal string so any future form
+# count keeps working with no code change.
+SEND_FORMS_BUTTON_RE = re.compile(r"^send\s+(\d+\s+)?forms?$", re.I)
+
 # --- CREDENTIALS ---
 ECW_USERNAME = os.getenv("ECW_USERNAME")
 ECW_PASSWORD = os.getenv("ECW_PASSWORD")
@@ -671,7 +677,7 @@ async def pediforms_send_forms(patients):
                             continue
 
                     if checked_forms:
-                        await page.get_by_role("button", name="Send form").click()
+                        await page.get_by_role("button", name=SEND_FORMS_BUTTON_RE).click()
                         print(f"Sent {[f['form_name'] for f in checked_forms]} successfully!")
                     else:
                         print(f"No matching form checkboxes found for {patient['acct_no']} - nothing sent")
@@ -719,6 +725,16 @@ async def pcarelink_send_messages(patients):
         await page.locator('[data-test-id="pcl-dashboard-popOver1"]').click()
         await page.wait_for_load_state("networkidle")
 
+        # The practice filter button's own visible text is NOT stable across
+        # patients: it reads "Filter by Practice" only before anything has
+        # ever been selected, then switches to showing whichever practice
+        # name was picked last (e.g. "Ped Center Of Round Rock") and stays
+        # that way - it never reverts to the placeholder. Track what it's
+        # currently showing ourselves (we're the ones who set it) instead of
+        # hardcoding either the placeholder or any specific practice name, so
+        # this works for any practice, in any order, indefinitely.
+        current_filter_label = "Filter by Practice"
+
         for patient in patients:
             try:
                 practice = resolve_practice_for_facility(patient.get("facility"))
@@ -733,9 +749,16 @@ async def pcarelink_send_messages(patients):
                     continue
 
                 print(f"\nSending message for {patient['acct_no']} ({patient['last_name']} {patient['first_name']})")
-                await page.get_by_role("button", name="Filter by Practice").click()
+                try:
+                    await page.get_by_role("button", name=current_filter_label).click(timeout=10000)
+                except Exception:
+                    # Fallback in case our tracked label ever gets out of
+                    # sync with what's actually on screen - the placeholder
+                    # is the only other state this button can be in.
+                    await page.get_by_role("button", name="Filter by Practice").click(timeout=10000)
                 await page.get_by_text(practice, exact=False).click()
                 await page.wait_for_timeout(2000)
+                current_filter_label = practice
                 print(f"Filtered by practice: {practice}")
 
                 search_box = page.get_by_role("searchbox", name="Enter patient first name or")
