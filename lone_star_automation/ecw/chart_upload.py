@@ -42,6 +42,20 @@ async def run(patients):
     log.info("STEP 4 - ECW: UPLOADING FORMS")
     log.info("=" * 50)
 
+    # (fix 2026-07-30) Previously had no session-level guard - a login
+    # failure here used to crash the whole run. Now caught and logged;
+    # nothing gets marked completed (same as if zero patients had been
+    # ready), and everything remains 'downloaded' for retry next run.
+    try:
+        return await _run_session(patients)
+    except Exception as e:
+        log.error(f"eCW upload session failed: {e}")
+        log.warning(f"No files confirmed uploaded this run for {len(patients)} patient(s) - "
+                    f"they remain 'downloaded' and will be retried on the next run.")
+        return []
+
+
+async def _run_session(patients):
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=False, slow_mo=200)
         context = await browser.new_context()

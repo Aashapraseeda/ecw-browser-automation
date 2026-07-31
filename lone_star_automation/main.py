@@ -48,33 +48,48 @@ async def main():
 
     # --- STEP 0: eCW export (with Facility filter) ---
     # (2026-07-21) tomorrow through +3 days - was a 7-day window starting today.
-    await schedule_export.run(window_days=2, start_offset_days=1)
-
-    # --- STEP 1a: determine Well-Check eligibility from the Excel itself
-    # (Visit Type/Visit Reason + DOB-based age, 9-48 months inclusive) ---
-    exported_patients = form_sender.read_eligible_patients_from_excel(settings.EXCEL_PATH)
-    log.info(f"Found {len(exported_patients)} ASQ-eligible patients in this export")
-
-    new_patients = [
-        p for p in exported_patients
-        if not state_db.is_known(p["acct_no"], p["appointment_date"])
-    ]
-    already_known = len(exported_patients) - len(new_patients)
-    log.info(f"{len(new_patients)} new patient-visits, {already_known} already processed (skipping resend)")
+    # (fix 2026-07-30) A failed export (e.g. eCW login hiccup) used to crash
+    # the whole script here, before even the UNRELATED "check pending
+    # patients from prior runs" section below ever ran. Now it's caught,
+    # logged clearly, and only the new-patient section (which genuinely
+    # depends on a fresh export) is skipped - the pending-patients section
+    # still runs, since it doesn't need this run's export at all.
+    export_ok = True
+    try:
+        await schedule_export.run(window_days=2, start_offset_days=1)
+    except Exception as e:
+        export_ok = False
+        log.error(f"Schedule export failed: {e}")
+        log.warning("Skipping new-patient processing this run (no fresh schedule to read) - "
+                    "will still check pending patients from prior runs below.")
 
     sent_patients = []
-    if new_patients:
-        # --- STEP 1b: Patient Forms Now - import full schedule, then
-        # search + send only for the patients determined eligible above ---
-        sent_patients = await form_sender.run_from_excel_list(new_patients)
-        for p in sent_patients:
-            state_db.insert_form_sent(p)
+    messaging_failed = []
+    if export_ok:
+        # --- STEP 1a: determine Well-Check eligibility from the Excel itself
+        # (Visit Type/Visit Reason + DOB-based age, 9-48 months inclusive) ---
+        exported_patients = form_sender.read_eligible_patients_from_excel(settings.EXCEL_PATH)
+        log.info(f"Found {len(exported_patients)} ASQ-eligible patients in this export")
 
-        # --- STEP 2: PCareLink - reminder messages for patients just sent a form ---
-        if sent_patients:
-            await pcarelink_messenger.send_messages(sent_patients)
-    else:
-        log.info("No new patients to send forms to this run.")
+        new_patients = [
+            p for p in exported_patients
+            if not state_db.is_known(p["acct_no"], p["appointment_date"])
+        ]
+        already_known = len(exported_patients) - len(new_patients)
+        log.info(f"{len(new_patients)} new patient-visits, {already_known} already processed (skipping resend)")
+
+        if new_patients:
+            # --- STEP 1b: Patient Forms Now - import full schedule, then
+            # search + send only for the patients determined eligible above ---
+            sent_patients = await form_sender.run_from_excel_list(new_patients)
+            for p in sent_patients:
+                state_db.insert_form_sent(p)
+
+            # --- STEP 2: PCareLink - reminder messages for patients just sent a form ---
+            if sent_patients:
+                _messaged, messaging_failed = await pcarelink_messenger.send_messages(sent_patients)
+        else:
+            log.info("No new patients to send forms to this run.")
 
     # --- STEP 3: check ALL pending patients (from DB, not just today's export) ---
     pending = state_db.get_pending_patients()
@@ -95,6 +110,11 @@ async def main():
     deleted = state_db.cleanup_old_completed(settings.STATE_RETENTION_DAYS)
     if deleted:
         log.info(f"Cleaned up {deleted} completed record(s) older than {settings.STATE_RETENTION_DAYS} days.")
+
+    if messaging_failed:
+        log.warning(f"{len(messaging_failed)} patient(s) did not get a ReachMyDr message this run "
+                    f"(see the REACHMYDR MESSAGE FAILURES report above/in logs/ for the full list) - "
+                    f"manual follow-up recommended.")
 
     log.info("=" * 50)
     log.info("RUN COMPLETE!")

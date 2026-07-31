@@ -295,6 +295,7 @@ def read_eligible_patients_from_excel(excel_path):
             "form_name": ", ".join(f["form_name"] for f in forms),
             "form_filename": "_".join(f["form_filename"] for f in forms),
             "facility": str(facility_raw).strip() if facility_raw else "",
+            "dob": dob.isoformat() if dob else None,
         })
     return patients
 
@@ -335,7 +336,25 @@ async def run_from_excel_list(patients):
     """Owns the browser session: login -> import full schedule -> search
     PFN by account number for each pre-computed eligible patient -> send.
     Returns the patients a form was actually sent to (drives state_db
-    bookkeeping + PCareLink)."""
+    bookkeeping + PCareLink).
+
+    (fix 2026-07-30) Previously had no session-level guard - a login
+    failure here used to crash the whole run (messaging, download-check,
+    upload, cleanup all skipped too). Now caught and logged; an empty
+    result means "nothing confirmed sent", which the caller already
+    correctly treats as "skip messaging, nothing to insert" - the same
+    as if zero patients had actually been eligible this run.
+    """
+    try:
+        return await _run_from_excel_list_session(patients)
+    except Exception as e:
+        log.error(f"Patient Forms Now session failed before/during sending: {e}")
+        log.warning(f"No forms confirmed sent this run for {len(patients)} patient(s) - "
+                    f"they remain eligible and will be retried on the next run.")
+        return []
+
+
+async def _run_from_excel_list_session(patients):
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=False, slow_mo=300)
         context = await browser.new_context()

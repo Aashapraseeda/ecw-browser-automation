@@ -301,7 +301,9 @@ async def main():
 
         # --- STEP 2: PCareLink - reminder messages for patients just sent a form ---
         if sent_patients:
-            await pcarelink_messenger.send_messages(sent_patients)
+            _messaged, messaging_failed = await pcarelink_messenger.send_messages(sent_patients)
+            if messaging_failed:
+                log.warning(f"{len(messaging_failed)} demo patient(s) did not get a ReachMyDr message this run.")
     else:
         log.info("No new demo patients to send forms to this run.")
 

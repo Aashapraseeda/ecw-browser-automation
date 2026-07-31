@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 from playwright.async_api import async_playwright
 
 import state_db
+import failure_report
 
 load_dotenv()
 
@@ -283,6 +284,7 @@ def read_patients_from_excel():
         last_name = row[col["Patient Last Name"]]
         first_name = row[col["Patient First Name"]]
         visit_type_raw = row[col["Visit Type"]]
+        visit_reason_raw = row[col["Visit Reason"]] if "Visit Reason" in col else None
         appointment_date_raw = row[col["Appointment Date"]]
         dob_raw = row[col["Patient DOB"]] if "Patient DOB" in col else None
         if not acct_no:
@@ -294,6 +296,13 @@ def read_patients_from_excel():
 
         visit_type_desc = str(visit_type_raw).split(":")[-1].strip().upper() if visit_type_raw else ""
         is_well_check = visit_type_desc.endswith(" WC") or visit_type_desc == "WC"
+        # (fix 2026-07-28) Some clinics record a generic "WELL : Well Check"
+        # or "NP : New Patient" Visit Type with the actual age only in Visit
+        # Reason (e.g. "*12 MONTH WELL CHILD CHECK") - the structural " WC"
+        # check above misses those entirely. Fall back to Visit Reason
+        # before excluding, matching lone_star_automation's existing logic.
+        if not is_well_check and visit_reason_raw:
+            is_well_check = "WELL CHILD CHECK" in str(visit_reason_raw).upper()
         if not is_well_check:
             print(f"Skipping {last_name} {first_name} - not a Well Check visit type: {visit_type_desc!r}")
             continue
@@ -320,6 +329,7 @@ def read_patients_from_excel():
             "form_name": ", ".join(f["form_name"] for f in forms),
             "form_filename": "_".join(f["form_filename"] for f in forms),
             "facility": str(facility_name_raw).strip() if facility_name_raw else "",
+            "dob": dob.isoformat() if dob else None,
         })
         filtered_rows.append(row)
 
@@ -612,6 +622,21 @@ async def pediforms_send_forms(patients):
     print("STEP 1 — PEDIFORMS: SENDING FORMS")
     print("="*50)
 
+    # (fix 2026-07-30) Previously had no session-level guard at all - a
+    # login failure here used to crash the entire remaining run (messaging,
+    # download-check, upload, cleanup all skipped too). Now it's caught and
+    # logged; patients simply remain un-sent and get retried next run, the
+    # same as any other kind of per-patient send failure already handled
+    # inside this function's own loop.
+    try:
+        await _pediforms_send_forms_session(patients)
+    except Exception as e:
+        print(f"\nERROR: Patient Forms Now session failed before/during sending: {e}")
+        print(f"No forms confirmed sent this run for {len(patients)} patient(s) - "
+              f"they remain eligible and will be retried on the next run.")
+
+
+async def _pediforms_send_forms_session(patients):
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=False, slow_mo=300)
         context = await browser.new_context()
@@ -702,11 +727,68 @@ async def pediforms_send_forms(patients):
 # STEP 2 — PCARELINK: SEND MESSAGES
 # ─────────────────────────────────────────
 
+PATIENT_SEARCH_ATTEMPTS = 3
+PATIENT_SEARCH_RETRY_WAIT_MS = 1500
+
+
+async def _find_and_open_patient_in_pcarelink(page, patient):
+    """
+    Searches for a patient by account number and opens their result.
+    Retries the WHOLE search cycle (re-click, re-fill, re-attempt) up to
+    PATIENT_SEARCH_ATTEMPTS times rather than a single fill + fixed sleep +
+    one lookup - live logs showed ~38% of lookups failing on the first
+    attempt with no consistent pattern by patient, the signature of a
+    timing/race issue (or a search box that doesn't always register a
+    single .fill() the same way real keystrokes would) rather than a
+    genuine "this patient isn't in ReachMyDr" case. Returns True/False.
+    """
+    target_text = f"{patient['last_name'].upper()}, {patient['first_name'].upper()}"
+    search_box = page.get_by_role("searchbox", name="Enter patient first name or")
+    for attempt in range(PATIENT_SEARCH_ATTEMPTS):
+        await search_box.click()
+        await search_box.fill("")
+        await search_box.fill(patient["acct_no"])
+        try:
+            await page.get_by_text(target_text).first.click(timeout=8000)
+            return True
+        except Exception:
+            if attempt < PATIENT_SEARCH_ATTEMPTS - 1:
+                print(f"Patient {patient['acct_no']} not found on attempt "
+                      f"{attempt + 1}/{PATIENT_SEARCH_ATTEMPTS} - retrying...")
+                await page.wait_for_timeout(PATIENT_SEARCH_RETRY_WAIT_MS)
+    return False
+
+
 async def pcarelink_send_messages(patients):
     print("\n" + "="*50)
     print("STEP 2 — PCARELINK: SENDING MESSAGES")
     print("="*50)
 
+    messaged, failed = [], []
+
+    # (fix 2026-07-30) Previously had no session-level guard at all - if
+    # login (or anything else outside the per-patient loop below) raised,
+    # the exception propagated all the way out uncaught, which meant the
+    # failure report below never even got built/saved. Now, on a total
+    # session crash, every patient not already accounted for by the
+    # per-patient loop gets recorded as failed with a clear reason, so the
+    # report always reflects reality - even in the crash case - instead of
+    # silently not existing for this run.
+    try:
+        await _pcarelink_send_messages_session(patients, messaged, failed)
+    except Exception as e:
+        print(f"\nERROR: ReachMyDr session failed: {e}")
+        processed_accts = {p["acct_no"] for p in messaged} | {f["acct_no"] for f in failed}
+        for patient in patients:
+            if patient.get("acct_no") not in processed_accts:
+                failure_report.record_failure(failed, patient, f"ReachMyDr session failed: {e}")
+
+    failure_report.print_and_save_failure_report(failed, os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs"))
+
+    return messaged, failed
+
+
+async def _pcarelink_send_messages_session(patients, messaged, failed):
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=False, slow_mo=300)
         context = await browser.new_context()
@@ -736,6 +818,7 @@ async def pcarelink_send_messages(patients):
         current_filter_label = "Filter by Practice"
 
         for patient in patients:
+            practice = None
             try:
                 practice = resolve_practice_for_facility(patient.get("facility"))
 
@@ -746,36 +829,65 @@ async def pcarelink_send_messages(patients):
                 if not practice:
                     print(f"WARNING: no ReachMyDr practice mapping for facility {patient.get('facility')!r} "
                           f"(acct {patient['acct_no']}) - skipping message, NOT guessing a practice.")
+                    failure_report.record_failure(failed, patient, "Practice mapping not found")
                     continue
 
                 print(f"\nSending message for {patient['acct_no']} ({patient['last_name']} {patient['first_name']})")
-                try:
-                    await page.get_by_role("button", name=current_filter_label).click(timeout=10000)
-                except Exception:
-                    # Fallback in case our tracked label ever gets out of
-                    # sync with what's actually on screen - the placeholder
-                    # is the only other state this button can be in.
-                    await page.get_by_role("button", name="Filter by Practice").click(timeout=10000)
-                await page.get_by_text(practice, exact=False).click()
-                await page.wait_for_timeout(2000)
-                current_filter_label = practice
-                print(f"Filtered by practice: {practice}")
 
-                search_box = page.get_by_role("searchbox", name="Enter patient first name or")
-                await search_box.click()
-                await search_box.fill(patient["acct_no"])
-                await page.wait_for_timeout(2000)
+                # --- practice filter selection (mechanics UNCHANGED from the
+                # earlier fix - only wrapped here to tag WHICH step failed) ---
                 try:
-                    await page.get_by_text(f"{patient['last_name'].upper()}, {patient['first_name'].upper()}").first.click(timeout=10000)
-                except:
                     try:
-                        await page.locator(".patient-result, .search-result").first.click(timeout=5000)
-                    except:
-                        print(f"Patient {patient['acct_no']} not found - skipping")
-                        continue
+                        await page.get_by_role("button", name=current_filter_label).click(timeout=10000)
+                    except Exception:
+                        # Fallback in case our tracked label ever gets out of
+                        # sync with what's actually on screen - the placeholder
+                        # is the only other state this button can be in.
+                        await page.get_by_role("button", name="Filter by Practice").click(timeout=10000)
+                    try:
+                        # Scoped to the open menu's own container
+                        # (#menu-clinics, confirmed from the live strict-mode
+                        # error dump) - a bare page-wide get_by_text matches
+                        # BOTH the freshly-opened menu item AND the closed
+                        # dropdown's own leftover display text whenever the
+                        # same practice is chosen twice in a row, which
+                        # crashes with a strict-mode violation and leaves
+                        # the dropdown open for the next patient.
+                        await page.locator("#menu-clinics").get_by_text(practice, exact=False).click(timeout=8000)
+                    except Exception:
+                        # Last-resort fallback so a DOM change here degrades
+                        # to "may pick the wrong element" rather than
+                        # crashing the whole patient - .first guarantees no
+                        # strict-mode error.
+                        await page.get_by_text(practice, exact=False).first.click(timeout=5000)
+                    await page.wait_for_timeout(2000)
+                    current_filter_label = practice
+                    print(f"Filtered by practice: {practice}")
+                except Exception as e:
+                    print(f"Error selecting practice: {e}")
+                    reason = "Timeout during practice selection" if "Timeout" in str(e) else "Practice selection failed"
+                    failure_report.record_failure(failed, patient, reason, practice=practice)
+                    continue
+
+                # --- patient search (retry helper UNCHANGED from the earlier fix) ---
+                found = await _find_and_open_patient_in_pcarelink(page, patient)
+                if not found:
+                    print(f"Patient {patient['acct_no']} not found after {PATIENT_SEARCH_ATTEMPTS} attempts - skipping")
+                    failure_report.record_failure(failed, patient, "Patient not found in ReachMyDr", practice=practice)
+                    continue
                 await page.wait_for_timeout(1000)
-                await page.locator('[data-test-id="pcl-payments-sendMessageLinkGuarantorDrawer"]').click()
-                await page.wait_for_timeout(1000)
+
+                # --- open the message drawer ---
+                try:
+                    await page.locator('[data-test-id="pcl-payments-sendMessageLinkGuarantorDrawer"]').click()
+                    await page.wait_for_timeout(1000)
+                except Exception as e:
+                    print(f"Error opening message drawer: {e}")
+                    reason = "Timeout opening message drawer" if "Timeout" in str(e) else f"Error opening message drawer: {e}"
+                    failure_report.record_failure(failed, patient, reason, practice=practice)
+                    continue
+
+                # message-type selection - UNCHANGED, still non-fatal
                 try:
                     await page.get_by_role("button", name=practice).click(timeout=5000)
                     await page.wait_for_timeout(500)
@@ -784,17 +896,37 @@ async def pcarelink_send_messages(patients):
                     await page.wait_for_timeout(500)
                 except:
                     print("Message type selection skipped")
-                message_box = page.get_by_role("textbox", name="Type your response and send")
-                await message_box.click()
-                await message_box.fill(PCARELINK_MESSAGE)
-                print("Message typed!")
-                await page.locator('[data-test-id="pcl-payments-sendMessageButton"]').click()
-                print("Message sent!")
+
+                # --- fill and send the message ---
+                try:
+                    message_box = page.get_by_role("textbox", name="Type your response and send")
+                    await message_box.click()
+                    await message_box.fill(PCARELINK_MESSAGE)
+                    print("Message typed!")
+                    await page.locator('[data-test-id="pcl-payments-sendMessageButton"]').click()
+                    print("Message sent!")
+                    messaged.append(patient)
+                except Exception as e:
+                    print(f"Error sending message: {e}")
+                    reason = "Timeout while sending the message" if "Timeout" in str(e) else f"Error sending message: {e}"
+                    failure_report.record_failure(failed, patient, reason, practice=practice)
+                    continue
+
+                # --- best-effort cleanup only - the message already sent
+                # successfully above, so a failure here must NOT retroactively
+                # mark this patient as failed (that would put them in BOTH
+                # the messaged and failed lists).
                 await page.wait_for_timeout(1000)
-                await page.locator('[data-test-id="pcl-appointments-closePatientsDetails"]').click()
+                try:
+                    await page.locator('[data-test-id="pcl-appointments-closePatientsDetails"]').click()
+                except:
+                    pass
                 await page.wait_for_timeout(1000)
             except Exception as e:
+                # True catch-all for anything unexpected not already
+                # handled by one of the specific blocks above.
                 print(f"Error: {e}")
+                failure_report.record_failure(failed, patient, f"Unexpected error: {e}", practice=practice)
                 try:
                     await page.locator('[data-test-id="pcl-appointments-closePatientsDetails"]').click()
                 except:
@@ -995,6 +1127,22 @@ async def ecw_upload_forms(patients):
     print("STEP 4 — ECW: UPLOADING FORMS")
     print("="*50)
 
+    # (fix 2026-07-30) Previously had no session-level guard - a login
+    # failure here used to crash the whole run, and no completed record
+    # was ever marked (which was harmless), but cleanup below never ran
+    # either. Now caught and logged; nothing gets marked completed (same
+    # as if zero patients had been ready), and everything remains
+    # 'downloaded' for retry on the next run.
+    try:
+        return await _ecw_upload_forms_session(patients)
+    except Exception as e:
+        print(f"\nERROR: eCW upload session failed: {e}")
+        print(f"No files confirmed uploaded this run for {len(patients)} patient(s) - "
+              f"they remain 'downloaded' and will be retried on the next run.")
+        return []
+
+
+async def _ecw_upload_forms_session(patients):
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=False, slow_mo=200)
         context = await browser.new_context()
@@ -1173,26 +1321,41 @@ async def main():
     print("PRODUCTION PIPELINE — ALL ASQ PATIENTS")
     print("="*50)
 
-    await ecw_export_schedule()
+    # (fix 2026-07-30) A failed export (e.g. eCW login hiccup) used to crash
+    # the whole script here, before even the UNRELATED "check pending
+    # patients from prior runs" section below ever ran. Now it's caught,
+    # logged clearly, and only the new-patient section (which genuinely
+    # depends on a fresh export) is skipped - the pending-patients section
+    # still runs, since it doesn't need this run's export at all.
+    export_ok = True
+    try:
+        await ecw_export_schedule()
+    except Exception as e:
+        export_ok = False
+        print(f"\nERROR: schedule export failed: {e}")
+        print("Skipping new-patient processing this run (no fresh schedule to read) - "
+              "will still check pending patients from prior runs below.")
 
-    exported_patients = read_patients_from_excel()
-    print(f"\nFound {len(exported_patients)} ASQ patients in this export")
+    messaging_failed = []
+    if export_ok:
+        exported_patients = read_patients_from_excel()
+        print(f"\nFound {len(exported_patients)} ASQ patients in this export")
 
-    # --- Split into new vs already-processed (by acct_no + appointment_date) ---
-    new_patients = [
-        p for p in exported_patients
-        if not state_db.is_known(p["acct_no"], p["appointment_date"])
-    ]
-    already_known = len(exported_patients) - len(new_patients)
-    print(f"{len(new_patients)} new patient-visits, {already_known} already processed (skipping resend)")
+        # --- Split into new vs already-processed (by acct_no + appointment_date) ---
+        new_patients = [
+            p for p in exported_patients
+            if not state_db.is_known(p["acct_no"], p["appointment_date"])
+        ]
+        already_known = len(exported_patients) - len(new_patients)
+        print(f"{len(new_patients)} new patient-visits, {already_known} already processed (skipping resend)")
 
-    if new_patients:
-        await pediforms_send_forms(new_patients)
-        await pcarelink_send_messages(new_patients)
-        for p in new_patients:
-            state_db.insert_form_sent(p)
-    else:
-        print("No new patients to send forms to this run.")
+        if new_patients:
+            await pediforms_send_forms(new_patients)
+            _messaged, messaging_failed = await pcarelink_send_messages(new_patients)
+            for p in new_patients:
+                state_db.insert_form_sent(p)
+        else:
+            print("No new patients to send forms to this run.")
 
     # --- Check ALL pending patients (from DB, not just today's export) ---
     pending = state_db.get_pending_patients()
@@ -1214,11 +1377,19 @@ async def main():
     if deleted:
         print(f"\nCleaned up {deleted} completed record(s) older than {STATE_RETENTION_DAYS} days.")
 
+    if messaging_failed:
+        print(f"\n{len(messaging_failed)} patient(s) did not get a ReachMyDr message this run "
+              f"(see the REACHMYDR MESSAGE FAILURES report above/in logs/ for the full list) - "
+              f"manual follow-up recommended.")
+
     print("\n" + "="*50)
     print("RUN COMPLETE!")
     print("="*50)
 
 if __name__ == "__main__":
+    import logging_setup
+    _log_file_path = logging_setup.enable_full_run_logging()
+    print(f"Full run output is also being saved to: {_log_file_path}")
     asyncio.run(main())
 
 # import asyncio
